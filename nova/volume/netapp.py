@@ -35,6 +35,7 @@ from nova import flags
 from nova import log as logging
 from nova.openstack.common import cfg
 from nova.volume import driver
+from nova import utils
 
 LOG = logging.getLogger("nova.volume.driver")
 
@@ -209,6 +210,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
                 AssumeConfirmation=True,
                 StorageSetDetails=details)
 
+    @utils.synchronized('netapp_dfm', True)
     def _provision(self, name, description, project, size):
         """
         Provision a LUN through provisioning manager. The LUN will be created
@@ -251,6 +253,7 @@ class NetAppISCSIDriver(driver.ISCSIDriver):
         if not lun_id:
             raise exception.Error(_('No LUN was created by the provision job'))
 
+    @utils.synchronized('netapp_dfm', True)
     def _remove_destroy(self, name, project):
         """
         Remove the LUN from the dataset and destroy the actual LUN on the
