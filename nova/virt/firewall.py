@@ -17,9 +17,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from nova.compute import utils as compute_utils
 from nova import context
 from nova import db
 from nova import flags
+from nova.network import linux_net
 from nova.openstack.common import cfg
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
@@ -138,11 +140,14 @@ class IptablesFirewallDriver(FirewallDriver):
     """Driver which enforces security groups through iptables rules."""
 
     def __init__(self, **kwargs):
-        from nova.network import linux_net
         self.iptables = linux_net.iptables_manager
         self.instances = {}
         self.network_infos = {}
         self.basicly_filtered = False
+
+        # Flags for DHCP request rule
+        self.dhcp_create = False
+        self.dhcp_created = False
 
         self.iptables.ipv4['filter'].add_chain('sg-fallback')
         self.iptables.ipv4['filter'].add_rule('sg-fallback', '-j DROP')
@@ -186,6 +191,17 @@ class IptablesFirewallDriver(FirewallDriver):
         LOG.debug(_('Filters added to instance'), instance=instance)
         self.refresh_provider_fw_rules()
         LOG.debug(_('Provider Firewall Rules refreshed'), instance=instance)
+        # Ensure that DHCP request rule is updated if necessary
+        if (self.dhcp_create and not self.dhcp_created):
+            self.iptables.ipv4['filter'].add_rule(
+                    'INPUT',
+                    '-s 0.0.0.0/32 -d 255.255.255.255/32 '
+                    '-p udp -m udp --sport 68 --dport 67 -j ACCEPT')
+            self.iptables.ipv4['filter'].add_rule(
+                    'FORWARD',
+                    '-s 0.0.0.0/32 -d 255.255.255.255/32 '
+                    '-p udp -m udp --sport 68 --dport 67 -j ACCEPT')
+            self.dhcp_created = True
         self.iptables.apply()
 
     def _create_filter(self, ips, chain_name):
@@ -267,6 +283,7 @@ class IptablesFirewallDriver(FirewallDriver):
             if dhcp_server:
                 ipv4_rules.append('-s %s -p udp --sport 67 --dport 68 '
                                   '-j ACCEPT' % (dhcp_server,))
+                self.dhcp_create = True
 
     def _do_project_network_rules(self, ipv4_rules, ipv6_rules, network_info):
         # make sure this is legacy nw_info
@@ -388,16 +405,9 @@ class IptablesFirewallDriver(FirewallDriver):
                     fw_rules += [' '.join(args)]
                 else:
                     if rule['grantee_group']:
-                        # FIXME(jkoelker) This needs to be ported up into
-                        #                 the compute manager which already
-                        #                 has access to a nw_api handle,
-                        #                 and should be the only one making
-                        #                 making rpc calls.
-                        import nova.network
-                        nw_api = nova.network.API()
                         for instance in rule['grantee_group']['instances']:
-                            nw_info = nw_api.get_instance_nw_info(ctxt,
-                                                                  instance)
+                            nw_info = compute_utils.get_nw_info_for_instance(
+                                    instance)
 
                             ips = [ip['address']
                                 for ip in nw_info.fixed_ips()

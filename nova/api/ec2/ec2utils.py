@@ -129,7 +129,9 @@ def id_to_ec2_id(instance_id, template='i-%08x'):
 
 def id_to_ec2_inst_id(instance_id):
     """Get or create an ec2 instance ID (i-[base 16 number]) from uuid."""
-    if utils.is_uuid_like(instance_id):
+    if instance_id is None:
+        return None
+    elif utils.is_uuid_like(instance_id):
         ctxt = context.get_admin_context()
         int_id = get_int_id_from_instance_uuid(ctxt, instance_id)
         return id_to_ec2_id(int_id)
@@ -219,10 +221,6 @@ def get_int_id_from_snapshot_uuid(context, snapshot_uuid):
 def get_snapshot_uuid_from_int_id(context, int_id):
     return db.get_snapshot_uuid_by_ec2_id(context, int_id)
 
-
-def ec2_instance_id_to_uuid(context, ec2_id):
-    int_id = ec2_id_to_id(ec2_id)
-    return db.instance_get(context, int_id)['uuid']
 
 _c2u = re.compile('(((?<=[a-z])[A-Z])|([A-Z](?![A-Z]|$)))')
 

@@ -52,6 +52,7 @@ from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
+from nova import consoleauth
 import nova.context
 from nova import exception
 from nova import flags
@@ -86,12 +87,6 @@ compute_opts = [
                help="Where cached images are stored under $instances_path."
                     "This is NOT the full path - just a folder name."
                     "For per-compute-host cached images, set to _base_$my_ip"),
-    cfg.StrOpt('compute_driver',
-               default='nova.virt.connection.get_connection',
-               help='Driver to use for controlling virtualization. Options '
-                   'include: libvirt.LibvirtDriver, xenapi.XenAPIDriver, '
-                   'fake.FakeDriver, baremetal.BareMetalDriver, '
-                   'vmwareapi.VMWareESXDriver'),
     cfg.StrOpt('console_host',
                default=socket.gethostname(),
                help='Console proxy host to use to connect '
@@ -134,7 +129,7 @@ compute_opts = [
                     "Valid options are 'noop', 'log' and 'reap'. "
                     "Set to 'noop' to disable."),
     cfg.IntOpt("image_cache_manager_interval",
-               default=40,
+               default=0,
                help="Number of periodic scheduler ticks to wait between "
                     "runs of the image cache manager."),
     cfg.IntOpt("heal_instance_info_cache_interval",
@@ -241,6 +236,7 @@ class ComputeManager(manager.SchedulerDependentManager):
         self.compute_api = compute.API()
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         self.scheduler_rpcapi = scheduler_rpcapi.SchedulerAPI()
+        self.consoleauth_rpcapi = consoleauth.rpcapi.ConsoleAuthAPI()
 
         super(ComputeManager, self).__init__(service_name="compute",
                                              *args, **kwargs)
@@ -277,7 +273,7 @@ class ComputeManager(manager.SchedulerDependentManager):
             self.driver.filter_defer_apply_on()
 
         try:
-            for count, instance in enumerate(instances):
+            for instance in instances:
                 db_state = instance['power_state']
                 drv_state = self._get_power_state(context, instance)
                 closing_vm_states = (vm_states.DELETED,
@@ -297,10 +293,9 @@ class ComputeManager(manager.SchedulerDependentManager):
                 net_info = compute_utils.get_nw_info_for_instance(instance)
 
                 # We're calling plug_vifs to ensure bridge and iptables
-                # filters are present, calling it once is enough.
-                if count == 0:
-                    legacy_net_info = self._legacy_nw_info(net_info)
-                    self.driver.plug_vifs(instance, legacy_net_info)
+                # rules exist. This needs to be called for each instance.
+                legacy_net_info = self._legacy_nw_info(net_info)
+                self.driver.plug_vifs(instance, legacy_net_info)
 
                 if ((expect_running and FLAGS.resume_guests_state_on_host_boot)
                      or FLAGS.start_guests_on_host_boot):
@@ -321,6 +316,14 @@ class ComputeManager(manager.SchedulerDependentManager):
                     except NotImplementedError:
                         LOG.warning(_('Hypervisor driver does not support '
                                       'resume guests'), instance=instance)
+                    except Exception:
+                        # NOTE(vish): The instance failed to resume, so we
+                        #             set the instance to error and attempt
+                        #             to continue.
+                        LOG.warning(_('Failed to resume instance'),
+                                    instance=instance)
+                        self._set_instance_error_state(context,
+                                                       instance['uuid'])
 
                 elif drv_state == power_state.RUNNING:
                     # VMWareAPI drivers will raise an exception
@@ -485,17 +488,14 @@ class ComputeManager(manager.SchedulerDependentManager):
             self._notify_about_instance_usage(
                     context, instance, "create.start",
                     extra_usage_info=extra_usage_info)
-            network_info = self._allocate_network(context, instance,
-                                                  requested_networks)
+            network_info = None
             try:
                 limits = filter_properties.get('limits', {})
                 with self.resource_tracker.resource_claim(context, instance,
                         limits):
-                    # Resources are available to build this instance here,
-                    # mark it as belonging to this host:
-                    self._instance_update(context, instance['uuid'],
-                            host=self.host, launched_on=self.host)
 
+                    network_info = self._allocate_network(context, instance,
+                            requested_networks)
                     block_device_info = self._prep_block_device(context,
                             instance)
                     instance = self._spawn(context, instance, image_meta,
@@ -503,7 +503,13 @@ class ComputeManager(manager.SchedulerDependentManager):
                                            injected_files, admin_password)
 
             except exception.InstanceNotFound:
-                raise  # the instance got deleted during the spawn
+                # the instance got deleted during the spawn
+                try:
+                    self._deallocate_network(context, instance)
+                except Exception:
+                    msg = _('Failed to dealloc network for deleted instance')
+                    LOG.exception(msg, instance=instance)
+                raise
             except Exception:
                 # try to re-schedule instance:
                 self._reschedule_or_reraise(context, instance,
@@ -540,7 +546,7 @@ class ComputeManager(manager.SchedulerDependentManager):
         try:
             self._deallocate_network(context, instance)
         except Exception:
-            # do not attempt retry if network de-allocation occurs:
+            # do not attempt retry if network de-allocation failed:
             _log_original_error()
             raise
 
@@ -922,6 +928,10 @@ class ComputeManager(manager.SchedulerDependentManager):
         self._notify_about_instance_usage(context, instance, "delete.end",
                 system_metadata=system_meta)
 
+        if FLAGS.vnc_enabled:
+            self.consoleauth_rpcapi.delete_tokens_for_instance(context,
+                                                        instance["uuid"])
+
     @exception.wrap_exception(notifier=notifier, publisher_id=publisher_id())
     @wrap_instance_fault
     def terminate_instance(self, context, instance):
@@ -1188,7 +1198,7 @@ class ComputeManager(manager.SchedulerDependentManager):
         if image_type == 'snapshot' and rotation:
             raise exception.ImageRotationNotAllowed()
 
-        elif image_type == 'backup' and rotation:
+        elif image_type == 'backup' and rotation >= 0:
             self._rotate_backups(context, instance, backup_type, rotation)
 
         elif image_type == 'backup':
@@ -1216,8 +1226,13 @@ class ComputeManager(manager.SchedulerDependentManager):
             images = []
             marker = None
             while True:
-                batch = image_service.detail(context, filters=filters,
-                        marker=marker, sort_key='created_at', sort_dir='desc')
+                if marker is not None:
+                    batch = image_service.detail(context, filters=filters,
+                            marker=marker, sort_key='created_at',
+                            sort_dir='desc')
+                else:
+                    batch = image_service.detail(context, filters=filters,
+                            sort_key='created_at', sort_dir='desc')
                 if not batch:
                     break
                 images += batch
@@ -1480,6 +1495,12 @@ class ComputeManager(manager.SchedulerDependentManager):
             self._notify_about_instance_usage(
                     context, instance, "resize.revert.start")
 
+            instance = self._instance_update(context,
+                                        instance['uuid'],
+                                        host=migration_ref['source_compute'])
+            self.network_api.setup_networks_on_host(context, instance,
+                                            migration_ref['source_compute'])
+
             old_instance_type = migration_ref['old_instance_type_id']
             instance_type = instance_types.get_instance_type(old_instance_type)
 
@@ -1502,7 +1523,6 @@ class ComputeManager(manager.SchedulerDependentManager):
             self._instance_update(context,
                                   instance['uuid'],
                                   memory_mb=instance_type['memory_mb'],
-                                  host=migration_ref['source_compute'],
                                   vcpus=instance_type['vcpus'],
                                   root_gb=instance_type['root_gb'],
                                   ephemeral_gb=instance_type['ephemeral_gb'],
@@ -1548,6 +1568,11 @@ class ComputeManager(manager.SchedulerDependentManager):
                     context, instance, current_period=True)
             self._notify_about_instance_usage(
                     context, instance, "resize.prep.start")
+
+            if not instance['host']:
+                self._set_instance_error_state(context, instance['uuid'])
+                msg = _('Instance has no source host')
+                raise exception.MigrationError(msg)
 
             same_host = instance['host'] == self.host
             if same_host and not FLAGS.allow_resize_to_same_host:
@@ -1629,6 +1654,7 @@ class ComputeManager(manager.SchedulerDependentManager):
                                      {'status': 'post-migrating'})
 
             self._instance_update(context, instance['uuid'],
+                                  host=migration_ref['dest_compute'],
                                   task_state=task_states.RESIZE_MIGRATED,
                                   expected_task_state=task_states.
                                       RESIZE_MIGRATING)
@@ -1691,7 +1717,6 @@ class ComputeManager(manager.SchedulerDependentManager):
         instance = self._instance_update(context,
                                          instance['uuid'],
                                          vm_state=vm_states.RESIZED,
-                                         host=migration_ref['dest_compute'],
                                          launched_at=timeutils.utcnow(),
                                          task_state=None,
                                          expected_task_state=task_states.
@@ -1720,9 +1745,14 @@ class ComputeManager(manager.SchedulerDependentManager):
             self._finish_resize(context, instance, migration_ref,
                                 disk_info, image)
             self._quota_commit(context, reservations)
-        except Exception, error:
-            self._quota_rollback(context, reservations)
+        except Exception as error:
             with excutils.save_and_reraise_exception():
+                try:
+                    self._quota_rollback(context, reservations)
+                except Exception as qr_error:
+                    reason = _("Failed to rollback quota for failed "
+                            "finish_resize: %(qr_error)s")
+                    LOG.exception(reason % locals(), instance=instance)
                 LOG.error(_('%s. Setting instance vm_state to ERROR') % error,
                           instance=instance)
                 self._set_instance_error_state(context, instance['uuid'])
@@ -1965,6 +1995,12 @@ class ComputeManager(manager.SchedulerDependentManager):
         return connection_info
 
     @exception.wrap_exception(notifier=notifier, publisher_id=publisher_id())
+    @wrap_instance_fault
+    def validate_console_port(self, ctxt, instance, port, console_type):
+        console_info = self.driver.get_vnc_console(instance)
+        return console_info['port'] == port
+
+    @exception.wrap_exception(notifier=notifier, publisher_id=publisher_id())
     @reverts_task_state
     @wrap_instance_fault
     def reserve_block_device_name(self, context, instance, device):
@@ -1976,6 +2012,7 @@ class ComputeManager(manager.SchedulerDependentManager):
                                                                 device)
             # NOTE(vish): create bdm here to avoid race condition
             values = {'instance_uuid': instance['uuid'],
+                      'volume_id': 'reserved',
                       'device_name': result}
             self.db.block_device_mapping_create(context, values)
             return result
@@ -2162,6 +2199,13 @@ class ComputeManager(manager.SchedulerDependentManager):
         if not block_device_info['block_device_mapping']:
             LOG.info(_('Instance has no volume.'), instance=instance)
 
+        # assign the volume to host system
+        # needed by the lefthand volume driver and maybe others
+        connector = self.driver.get_volume_connector(instance)
+        for bdm in self._get_instance_volume_bdms(context, instance['uuid']):
+            volume = self.volume_api.get(context, bdm['volume_id'])
+            self.volume_api.initialize_connection(context, volume, connector)
+
         network_info = self._get_instance_nw_info(context, instance)
 
         # TODO(tr3buchet): figure out how on the earth this is necessary
@@ -2243,12 +2287,16 @@ class ComputeManager(manager.SchedulerDependentManager):
                  instance=instance_ref)
 
         # Detaching volumes.
+        connector = self.driver.get_volume_connector(instance_ref)
         for bdm in self._get_instance_volume_bdms(ctxt, instance_ref['uuid']):
             # NOTE(vish): We don't want to actually mark the volume
             #             detached, or delete the bdm, just remove the
             #             connection from this host.
-            self.remove_volume_connection(ctxt, bdm['volume_id'],
-                                          instance_ref)
+
+            # remove the volume connection without detaching from hypervisor
+            # because the instance is not running anymore on the current host
+            volume = self.volume_api.get(ctxt, bdm['volume_id'])
+            self.volume_api.terminate_connection(ctxt, volume, connector)
 
         # Releasing vlan.
         # (not necessary in current implementation?)
@@ -2701,9 +2749,8 @@ class ComputeManager(manager.SchedulerDependentManager):
                 pass
             elif vm_state == vm_states.ACTIVE:
                 # The only rational power state should be RUNNING
-                if vm_power_state in (power_state.NOSTATE,
-                                       power_state.SHUTDOWN,
-                                       power_state.CRASHED):
+                if vm_power_state in (power_state.SHUTDOWN,
+                                      power_state.CRASHED):
                     LOG.warn(_("Instance shutdown by itself. Calling "
                                "the stop API."), instance=db_instance)
                     try:
@@ -2719,10 +2766,8 @@ class ComputeManager(manager.SchedulerDependentManager):
                         LOG.exception(_("error during stop() in "
                                         "sync_power_state."),
                                       instance=db_instance)
-                elif vm_power_state in (power_state.PAUSED,
-                                        power_state.SUSPENDED):
-                    LOG.warn(_("Instance is paused or suspended "
-                               "unexpectedly. Calling "
+                elif vm_power_state == power_state.SUSPENDED:
+                    LOG.warn(_("Instance is suspended unexpectedly. Calling "
                                "the stop API."), instance=db_instance)
                     try:
                         self.compute_api.stop(context, db_instance)
@@ -2730,6 +2775,22 @@ class ComputeManager(manager.SchedulerDependentManager):
                         LOG.exception(_("error during stop() in "
                                         "sync_power_state."),
                                       instance=db_instance)
+                elif vm_power_state == power_state.PAUSED:
+                    # Note(maoy): a VM may get into the paused state not only
+                    # because the user request via API calls, but also
+                    # due to (temporary) external instrumentations.
+                    # Before the virt layer can reliably report the reason,
+                    # we simply ignore the state discrepancy. In many cases,
+                    # the VM state will go back to running after the external
+                    # instrumentation is done. See bug 1097806 for details.
+                    LOG.warn(_("Instance is paused unexpectedly. Ignore."),
+                             instance=db_instance)
+                elif vm_power_state == power_state.NOSTATE:
+                    # Occasionally, depending on the status of the hypervisor,
+                    # which could be restarting for example, an instance may
+                    # not be found.  Therefore just log the condidtion.
+                    LOG.warn(_("Instance is unexpectedly not found. Ignore."),
+                             instance=db_instance)
             elif vm_state == vm_states.STOPPED:
                 if vm_power_state not in (power_state.NOSTATE,
                                           power_state.SHUTDOWN,

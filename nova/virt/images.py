@@ -50,11 +50,21 @@ def qemu_img_info(path):
                              'qemu-img', 'info', path)
 
     # output of qemu-img is 'field: value'
+    # except when its in the snapshot listing mode
     data = {}
     for line in out.splitlines():
-        field, val = line.split(':', 1)
-        if val[0] == " ":
-            val = val[1:]
+        pieces = line.split(':', 1)
+        if len(pieces) != 2:
+            continue
+        (field, val) = pieces
+        field = field.strip().lower()
+        val = val.strip()
+        if field == 'snapshot list':
+            # Skip everything after the snapshot list
+            # which is safe to do since the code prints
+            # these out at the end and nobody currently
+            # uses this information in openstack as-is.
+            break
         data[field] = val
 
     return data
@@ -96,6 +106,7 @@ def fetch_to_raw(context, image_href, path, user_id, project_id):
             with utils.remove_path_on_error(staged):
                 utils.execute('qemu-img', 'convert', '-O', 'raw', path_tmp,
                               staged)
+                os.unlink(path_tmp)
 
                 data = qemu_img_info(staged)
                 if data.get('file format') != "raw":
@@ -104,6 +115,5 @@ def fetch_to_raw(context, image_href, path, user_id, project_id):
                         data.get('file format'))
 
                 os.rename(staged, path)
-
         else:
             os.rename(path_tmp, path)

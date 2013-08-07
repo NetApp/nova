@@ -128,13 +128,16 @@ def get_default_instance_type():
     return get_instance_type_by_name(name)
 
 
-def get_instance_type(instance_type_id, ctxt=None):
+def get_instance_type(instance_type_id, ctxt=None, inactive=False):
     """Retrieves single instance type by id."""
     if instance_type_id is None:
         return get_default_instance_type()
 
     if ctxt is None:
         ctxt = context.get_admin_context()
+
+    if inactive:
+        ctxt = ctxt.elevated(read_deleted="yes")
 
     return db.instance_type_get(ctxt, instance_type_id)
 
@@ -160,7 +163,7 @@ def get_instance_type_by_flavor_id(flavorid, ctxt=None, read_deleted="yes"):
     if ctxt is None:
         ctxt = context.get_admin_context(read_deleted=read_deleted)
 
-    return db.instance_type_get_by_flavor_id(ctxt, flavorid)
+    return db.instance_type_get_by_flavor_id(ctxt, flavorid, read_deleted)
 
 
 def get_instance_type_access_by_flavor_id(flavorid, ctxt=None):

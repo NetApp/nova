@@ -21,7 +21,6 @@ import socket
 
 import webob
 from webob import exc
-from xml.dom import minidom
 
 from nova.api.openstack import common
 from nova.api.openstack.compute import ips
@@ -32,6 +31,7 @@ from nova import compute
 from nova.compute import instance_types
 from nova import exception
 from nova import flags
+from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common.rpc import common as rpc_common
 from nova.openstack.common import timeutils
@@ -66,6 +66,7 @@ def make_server(elem, detailed=False):
         elem.set('accessIPv6')
         elem.set('status')
         elem.set('progress')
+        elem.set('reservation_id')
 
         # Attach image node
         image = xmlutil.SubTemplateElement(elem, 'image', selector='image')
@@ -239,13 +240,9 @@ class CommonDeserializer(wsgi.MetadataXMLDeserializer):
 
     def _extract_scheduler_hints(self, server_node):
         """Marshal the scheduler hints attribute of a parsed request"""
-        node = self.find_first_child_named(server_node,
-                                           "OS-SCH-HNT:scheduler_hints")
-        # NOTE(vish): Support the os: prefix because it is what we use
-        #             for json, even though OS-SCH-HNT: is more correct
-        if not node:
-            node = self.find_first_child_named(server_node,
-                                               "os:scheduler_hints")
+        node = self.find_first_child_named_in_namespace(server_node,
+            "http://docs.openstack.org/compute/ext/scheduler-hints/api/v2",
+            "scheduler_hints")
         if node:
             scheduler_hints = {}
             for child in self.extract_elements(node):
@@ -299,7 +296,7 @@ class ActionDeserializer(CommonDeserializer):
     """
 
     def default(self, string):
-        dom = minidom.parseString(string)
+        dom = utils.safe_minidom_parse_string(string)
         action_node = dom.childNodes[0]
         action_name = action_node.tagName
 
@@ -406,7 +403,7 @@ class CreateDeserializer(CommonDeserializer):
 
     def default(self, string):
         """Deserialize an xml-formatted server create request."""
-        dom = minidom.parseString(string)
+        dom = utils.safe_minidom_parse_string(string)
         server = self._extract_server(dom)
         return {'body': {'server': server}}
 
@@ -434,6 +431,7 @@ class Controller(wsgi.Controller):
         super(Controller, self).__init__(**kwargs)
         self.compute_api = compute.API()
         self.ext_mgr = ext_mgr
+        self.quantum_attempted = False
 
     @wsgi.serializers(xml=MinimalServersTemplate)
     def index(self, req):
@@ -485,8 +483,7 @@ class Controller(wsgi.Controller):
         if status is not None:
             state = common.vm_state_from_status(status)
             if state is None:
-                msg = _('Invalid server status: %(status)s') % locals()
-                raise exc.HTTPBadRequest(explanation=msg)
+                return {'servers': []}
             search_opts['vm_state'] = state
 
         if 'changes-since' in search_opts:
@@ -593,8 +590,20 @@ class Controller(wsgi.Controller):
         return injected_files
 
     def _is_quantum_v2(self):
-        return FLAGS.network_api_class ==\
-            "nova.network.quantumv2.api.API"
+        # NOTE(dprince): quantumclient is not a requirement
+        if self.quantum_attempted:
+            return self.have_quantum
+
+        try:
+            self.quantum_attempted = True
+            from nova.network.quantumv2 import api as quantum_api
+            self.have_quantum = issubclass(
+                importutils.import_class(FLAGS.network_api_class),
+                quantum_api.API)
+        except ImportError:
+            self.have_quantum = False
+
+        return self.have_quantum
 
     def _get_requested_networks(self, requested_networks):
         """Create a list of requested networks from the networks attribute."""
@@ -787,7 +796,11 @@ class Controller(wsgi.Controller):
 
         block_device_mapping = None
         if self.ext_mgr.is_loaded('os-volumes'):
-            block_device_mapping = server_dict.get('block_device_mapping')
+            block_device_mapping = server_dict.get('block_device_mapping', [])
+            for bdm in block_device_mapping:
+                if 'delete_on_termination' in bdm:
+                    bdm['delete_on_termination'] = utils.bool_from_str(
+                        bdm['delete_on_termination'])
 
         ret_resv_id = False
         # min_count and max_count are optional.  If they exist, they may come
@@ -830,7 +843,8 @@ class Controller(wsgi.Controller):
 
         try:
             _get_inst_type = instance_types.get_instance_type_by_flavor_id
-            inst_type = _get_inst_type(flavor_id, read_deleted="no")
+            inst_type = _get_inst_type(flavor_id, ctxt=context,
+                                       read_deleted="no")
 
             (instances, resv_id) = self.compute_api.create(context,
                             inst_type,
@@ -854,16 +868,20 @@ class Controller(wsgi.Controller):
                             auto_disk_config=auto_disk_config,
                             scheduler_hints=scheduler_hints)
         except exception.QuotaError as error:
-            raise exc.HTTPRequestEntityTooLarge(explanation=unicode(error),
-                                                headers={'Retry-After': 0})
+            raise exc.HTTPRequestEntityTooLarge(
+                explanation=error.format_message(),
+                headers={'Retry-After': 0})
         except exception.InstanceTypeMemoryTooSmall as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.format_message())
         except exception.InstanceTypeNotFound as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.format_message())
         except exception.InstanceTypeDiskTooSmall as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.format_message())
         except exception.InvalidMetadata as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.format_message())
+        except exception.InvalidMetadataSize as error:
+            raise exc.HTTPRequestEntityTooLarge(
+                explanation=error.format_message())
         except exception.ImageNotFound as error:
             msg = _("Can not find requested image")
             raise exc.HTTPBadRequest(explanation=msg)
@@ -874,7 +892,7 @@ class Controller(wsgi.Controller):
             msg = _("Invalid key_name provided.")
             raise exc.HTTPBadRequest(explanation=msg)
         except exception.SecurityGroupNotFound as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.format_message())
         except rpc_common.RemoteError as err:
             msg = "%(err_type)s: %(err_msg)s" % {'err_type': err.exc_type,
                                                  'err_msg': err.value}
@@ -885,7 +903,13 @@ class Controller(wsgi.Controller):
         # Let the caller deal with unhandled exceptions.
 
         # If the caller wanted a reservation_id, return it
-        if ret_resv_id:
+
+        # NOTE(treinish): XML serialization will not work without a root
+        # selector of 'server' however JSON return is not expecting a server
+        # field/object
+        if ret_resv_id and (req.get_content_type() == 'application/xml'):
+            return {'server': {'reservation_id': resv_id}}
+        elif ret_resv_id:
             return {'reservation_id': resv_id}
 
         req.cache_db_instances(instances)
@@ -1206,14 +1230,18 @@ class Controller(wsgi.Controller):
             msg = _("Instance could not be found")
             raise exc.HTTPNotFound(explanation=msg)
         except exception.InvalidMetadata as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(
+                explanation=error.format_message())
+        except exception.InvalidMetadataSize as error:
+            raise exc.HTTPRequestEntityTooLarge(
+                explanation=error.format_message())
         except exception.ImageNotFound:
             msg = _("Cannot find image for rebuild")
             raise exc.HTTPBadRequest(explanation=msg)
         except exception.InstanceTypeMemoryTooSmall as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.format_message())
         except exception.InstanceTypeDiskTooSmall as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.format_message())
 
         instance = self._get_server(context, req, id)
 

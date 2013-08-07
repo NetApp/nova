@@ -270,7 +270,7 @@ class CloudTestCase(test.TestCase):
                                                  project_id=project_id)
 
         fixed_ips = nw_info.fixed_ips()
-        ec2_id = ec2utils.id_to_ec2_inst_id(inst['id'])
+        ec2_id = ec2utils.id_to_ec2_inst_id(inst['uuid'])
 
         self.stubs.Set(ec2utils, 'get_ip_info_for_instance',
                        lambda *args: {'fixed_ips': ['10.0.0.1'],
@@ -288,6 +288,40 @@ class CloudTestCase(test.TestCase):
         self.network.deallocate_fixed_ip(self.context, fixed_ips[0]['address'],
                                          inst['host'])
         db.instance_destroy(self.context, inst['uuid'])
+        db.floating_ip_destroy(self.context, address)
+
+    def test_disassociate_auto_assigned_address(self):
+        """Verifies disassociating auto assigned floating IP
+        raises an exception
+        """
+        address = "10.10.10.10"
+
+        def fake_get(*args, **kwargs):
+            pass
+
+        def fake_disassociate_floating_ip(*args, **kwargs):
+            raise exception.CannotDisassociateAutoAssignedFloatingIP()
+
+        self.stubs.Set(network_api.API, 'get_instance_id_by_floating_address',
+                       lambda *args: 1)
+        self.stubs.Set(self.cloud.compute_api, 'get', fake_get)
+        self.stubs.Set(network_api.API, 'disassociate_floating_ip',
+                                    fake_disassociate_floating_ip)
+
+        self.assertRaises(exception.EC2APIError,
+                          self.cloud.disassociate_address,
+                          self.context, public_ip=address)
+
+    def test_disassociate_unassociated_address(self):
+        address = "10.10.10.10"
+        db.floating_ip_create(self.context,
+                              {'address': address,
+                               'pool': 'nova'})
+        self.cloud.allocate_address(self.context)
+        self.cloud.describe_addresses(self.context)
+        self.assertRaises(exception.InstanceNotFound,
+                          self.cloud.disassociate_address,
+                          self.context, public_ip=address)
         db.floating_ip_destroy(self.context, address)
 
     def test_describe_security_groups(self):
@@ -2065,12 +2099,14 @@ class CloudTestCase(test.TestCase):
         self.assertEqual(vol['mountpoint'], mountpoint)
         self.assertEqual(vol['status'], "in-use")
         self.assertEqual(vol['attach_status'], "attached")
+        self.assertNotEqual(vol['attach_time'], None)
 
     def _assert_volume_detached(self, vol):
         self.assertEqual(vol['instance_uuid'], None)
         self.assertEqual(vol['mountpoint'], None)
         self.assertEqual(vol['status'], "available")
         self.assertEqual(vol['attach_status'], "detached")
+        self.assertEqual(vol['attach_time'], None)
 
     def test_stop_start_with_volume(self):
         """Make sure run instance with block device mapping works"""
@@ -2092,8 +2128,8 @@ class CloudTestCase(test.TestCase):
                                             'delete_on_termination': True},
                                            ]}
         ec2_instance_id = self._run_instance(**kwargs)
-        instance_uuid = ec2utils.ec2_instance_id_to_uuid(self.context,
-                                                         ec2_instance_id)
+        instance_uuid = ec2utils.ec2_inst_id_to_uuid(self.context,
+                                                     ec2_instance_id)
         instance_id = ec2utils.ec2_id_to_id(ec2_instance_id)
 
         vols = db.volume_get_all_by_instance_uuid(self.context, instance_uuid)
@@ -2156,8 +2192,8 @@ class CloudTestCase(test.TestCase):
                                             'delete_on_termination': True}]}
         ec2_instance_id = self._run_instance(**kwargs)
         instance_id = ec2utils.ec2_id_to_id(ec2_instance_id)
-        instance_uuid = ec2utils.ec2_instance_id_to_uuid(self.context,
-                                                         ec2_instance_id)
+        instance_uuid = ec2utils.ec2_inst_id_to_uuid(self.context,
+                                                     ec2_instance_id)
 
         vols = db.volume_get_all_by_instance_uuid(self.context, instance_uuid)
         self.assertEqual(len(vols), 1)
@@ -2233,8 +2269,8 @@ class CloudTestCase(test.TestCase):
                                             'delete_on_termination': True}]}
         ec2_instance_id = self._run_instance(**kwargs)
         instance_id = ec2utils.ec2_vol_id_to_uuid(ec2_instance_id)
-        instance_uuid = ec2utils.ec2_instance_id_to_uuid(self.context,
-                                                         ec2_instance_id)
+        instance_uuid = ec2utils.ec2_inst_id_to_uuid(self.context,
+                                                     ec2_instance_id)
 
         vols = db.volume_get_all_by_instance_uuid(self.context, instance_uuid)
         self.assertEqual(len(vols), 2)
@@ -2488,6 +2524,13 @@ class CloudTestCase(test.TestCase):
                         'status': 'in-use'}
             raise exception.VolumeNotFound(volume_id=volume_id)
         self.stubs.Set(db, 'volume_get', fake_volume_get)
+
+        def fake_get_instance_uuid_by_ec2_id(ctxt, int_id):
+            if int_id == 305419896:
+                return 'e5fe5518-0288-4fa3-b0c4-c79764101b85'
+            raise exception.InstanceNotFound(instance_id=int_id)
+        self.stubs.Set(db, 'get_instance_uuid_by_ec2_id',
+                       fake_get_instance_uuid_by_ec2_id)
 
         get_attribute = functools.partial(
             self.cloud.describe_instance_attribute,

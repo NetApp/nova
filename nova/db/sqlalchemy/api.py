@@ -812,9 +812,12 @@ def floating_ip_fixed_ip_associate(context, floating_address,
         fixed_ip_ref = fixed_ip_get_by_address(context,
                                                fixed_address,
                                                session=session)
+        if floating_ip_ref.fixed_ip_id == fixed_ip_ref["id"]:
+            return None
         floating_ip_ref.fixed_ip_id = fixed_ip_ref["id"]
         floating_ip_ref.host = host
         floating_ip_ref.save(session=session)
+        return fixed_address
 
 
 @require_context
@@ -844,11 +847,17 @@ def floating_ip_destroy(context, address):
 def floating_ip_disassociate(context, address):
     session = get_session()
     with session.begin():
-        floating_ip_ref = floating_ip_get_by_address(context,
-                                                     address,
-                                                     session=session)
-        fixed_ip_ref = fixed_ip_get(context,
-                                    floating_ip_ref['fixed_ip_id'])
+        floating_ip_ref = model_query(context,
+                                      models.FloatingIp,
+                                      session=session).\
+                            filter_by(address=address).\
+                            first()
+        if not floating_ip_ref:
+            raise exception.FloatingIpNotFoundForAddress(address=address)
+
+        fixed_ip_ref = model_query(context, models.FixedIp, session=session).\
+                            filter_by(id=floating_ip_ref['fixed_ip_id']).\
+                            first()
         if fixed_ip_ref:
             fixed_ip_address = fixed_ip_ref['address']
         else:
@@ -1163,8 +1172,8 @@ def fixed_ip_disassociate_all_by_timeout(context, host, time):
 
 
 @require_context
-def fixed_ip_get(context, id, session=None):
-    result = model_query(context, models.FixedIp, session=session).\
+def fixed_ip_get(context, id):
+    result = model_query(context, models.FixedIp).\
                      filter_by(id=id).\
                      first()
     if not result:
@@ -1174,8 +1183,7 @@ def fixed_ip_get(context, id, session=None):
     # results?
     if is_user_context(context) and result['instance_uuid'] is not None:
         instance = instance_get_by_uuid(context.elevated(read_deleted='yes'),
-                                        result['instance_uuid'],
-                                        session)
+                                        result['instance_uuid'])
         authorize_project_context(context, instance.project_id)
 
     return result
@@ -1263,6 +1271,27 @@ def fixed_ip_update(context, address, values):
                                                session=session)
         fixed_ip_ref.update(values)
         fixed_ip_ref.save(session=session)
+
+
+@require_context
+def fixed_ip_count_by_project(context, project_id, session=None):
+    authorize_project_context(context, project_id)
+
+    # NOTE(mikal): Yes I know this is horrible, but I couldn't
+    # get a query using a join working, mainly because of a failure
+    # to be able to express the where clause sensibly. Patches
+    # welcome.
+    session = get_session()
+    with session.begin():
+        instance_uuid_query = model_query(context, models.Instance.uuid,
+                                          read_deleted="no", session=session).\
+                                 filter(models.Instance.project_id == \
+                                            project_id)
+        uuid_filter = models.FixedIp.instance_uuid.in_(instance_uuid_query)
+        return model_query(context, models.FixedIp, read_deleted="no",
+                           session=session).\
+                           filter(uuid_filter).\
+                           count()
 
 
 ###################
@@ -2212,7 +2241,9 @@ def network_get_associated_fixed_ips(context, network_id, host=None):
                           models.VirtualInterface.address,
                           models.Instance.hostname,
                           models.Instance.updated_at,
-                          models.Instance.created_at).\
+                          models.Instance.created_at,
+                          models.FixedIp.allocated,
+                          models.FixedIp.leased).\
                           filter(models.FixedIp.deleted == False).\
                           filter(models.FixedIp.network_id == network_id).\
                           filter(models.FixedIp.allocated == True).\
@@ -2234,6 +2265,8 @@ def network_get_associated_fixed_ips(context, network_id, host=None):
         cleaned['instance_hostname'] = datum[5]
         cleaned['instance_updated'] = datum[6]
         cleaned['instance_created'] = datum[7]
+        cleaned['allocated'] = datum[8]
+        cleaned['leased'] = datum[9]
         data.append(cleaned)
     return data
 
@@ -2981,6 +3014,7 @@ def volume_detached(context, volume_id):
         volume_ref['mountpoint'] = None
         volume_ref['attach_status'] = 'detached'
         volume_ref['instance_uuid'] = None
+        volume_ref['attach_time'] = None
         volume_ref.save(session=session)
 
 
@@ -3615,6 +3649,8 @@ def security_group_rule_get_by_security_group(context, security_group_id,
     return _security_group_rule_get_query(context, session=session).\
             filter_by(parent_group_id=security_group_id).\
             options(joinedload_all('grantee_group.instances.instance_type')).\
+            options(joinedload('grantee_group.instances.'
+                               'info_cache')).\
             all()
 
 
@@ -3876,7 +3912,7 @@ def instance_type_create(context, values):
             pass
         try:
             instance_type_get_by_flavor_id(context, values['flavorid'],
-                                           session)
+                    read_deleted='no', session=session)
             raise exception.InstanceTypeExists(name=values['name'])
         except exception.FlavorNotFound:
             pass
@@ -3918,9 +3954,16 @@ def _dict_with_extra_specs(inst_type_query):
 
 
 def _instance_type_get_query(context, session=None, read_deleted=None):
-    return model_query(context, models.InstanceTypes, session=session,
+    query = model_query(context, models.InstanceTypes, session=session,
                        read_deleted=read_deleted).\
-                     options(joinedload('extra_specs'))
+                       options(joinedload('extra_specs'))
+    if not context.is_admin:
+        the_filter = [models.InstanceTypes.is_public == True]
+        the_filter.extend([
+            models.InstanceTypes.projects.any(project_id=context.project_id)
+        ])
+        query = query.filter(or_(*the_filter))
+    return query
 
 
 @require_context
@@ -3995,9 +4038,11 @@ def instance_type_get_by_name(context, name, session=None):
 
 
 @require_context
-def instance_type_get_by_flavor_id(context, flavor_id, session=None):
+def instance_type_get_by_flavor_id(context, flavor_id, read_deleted,
+                                   session=None):
     """Returns a dict describing specific flavor_id"""
-    result = _instance_type_get_query(context, session=session).\
+    result = _instance_type_get_query(context, read_deleted=read_deleted,
+                                      session=session).\
                     filter_by(flavorid=flavor_id).\
                     first()
 
@@ -4049,7 +4094,7 @@ def instance_type_access_add(context, flavor_id, project_id):
     session = get_session()
     with session.begin():
         instance_type_ref = instance_type_get_by_flavor_id(context, flavor_id,
-                                                           session=session)
+                read_deleted='no', session=session)
         instance_type_id = instance_type_ref['id']
         access_ref = _instance_type_access_query(context, session=session).\
                         filter_by(instance_type_id=instance_type_id).\
@@ -4077,7 +4122,7 @@ def instance_type_access_remove(context, flavor_id, project_id):
     session = get_session()
     with session.begin():
         instance_type_ref = instance_type_get_by_flavor_id(context, flavor_id,
-                                                           session=session)
+                read_deleted='no', session=session)
         instance_type_id = instance_type_ref['id']
         access_ref = _instance_type_access_query(context, session=session).\
                         filter_by(instance_type_id=instance_type_id).\
@@ -4413,7 +4458,8 @@ def instance_type_extra_specs_update_or_create(context, flavor_id,
                                                specs):
     session = get_session()
     spec_ref = None
-    instance_type = instance_type_get_by_flavor_id(context, flavor_id)
+    instance_type = instance_type_get_by_flavor_id(context, flavor_id,
+                                                   read_deleted='no')
     for key, value in specs.iteritems():
         try:
             spec_ref = instance_type_extra_specs_get_item(
@@ -4853,10 +4899,20 @@ def sm_volume_get_all(context):
 ################
 
 
-def _aggregate_get_query(context, model_class, id_field, id,
+def _aggregate_get_query(context, model_class, id_field=None, id=None,
                          session=None, read_deleted=None):
-    return model_query(context, model_class, session=session,
-                       read_deleted=read_deleted).filter(id_field == id)
+    columns_to_join = {models.Aggregate: ['_hosts', '_metadata']}
+
+    query = model_query(context, model_class, session=session,
+                        read_deleted=read_deleted)
+
+    for c in columns_to_join.get(model_class, []):
+        query = query.options(joinedload(c))
+
+    if id and id_field:
+        query = query.filter(id_field == id)
+
+    return query
 
 
 @require_admin_context
@@ -4876,7 +4932,7 @@ def aggregate_create(context, values, metadata=None):
         raise exception.AggregateNameExists(aggregate_name=values['name'])
     if metadata:
         aggregate_metadata_add(context, aggregate.id, metadata)
-    return aggregate
+    return aggregate_get(context, aggregate.id)
 
 
 @require_admin_context
@@ -4967,7 +5023,7 @@ def aggregate_delete(context, aggregate_id):
 
 @require_admin_context
 def aggregate_get_all(context):
-    return model_query(context, models.Aggregate).all()
+    return _aggregate_get_query(context, models.Aggregate).all()
 
 
 @require_admin_context

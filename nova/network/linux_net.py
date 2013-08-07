@@ -30,6 +30,7 @@ from nova import flags
 from nova.openstack.common import cfg
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
+from nova.openstack.common import timeutils
 from nova import utils
 
 
@@ -277,7 +278,8 @@ class IptablesManager(object):
             self.execute = execute
 
         self.ipv4 = {'filter': IptablesTable(),
-                     'nat': IptablesTable()}
+                     'nat': IptablesTable(),
+                     'mangle': IptablesTable()}
         self.ipv6 = {'filter': IptablesTable()}
 
         self.iptables_apply_deferred = False
@@ -298,7 +300,8 @@ class IptablesManager(object):
 
         # Wrap the built-in chains
         builtin_chains = {4: {'filter': ['INPUT', 'OUTPUT', 'FORWARD'],
-                              'nat': ['PREROUTING', 'OUTPUT', 'POSTROUTING']},
+                              'nat': ['PREROUTING', 'OUTPUT', 'POSTROUTING'],
+                              'mangle': ['POSTROUTING']},
                           6: {'filter': ['INPUT', 'OUTPUT', 'FORWARD']}}
 
         for ip_version in builtin_chains:
@@ -703,7 +706,11 @@ def get_dhcp_leases(context, network_ref):
     for data in db.network_get_associated_fixed_ips(context,
                                                     network_ref['id'],
                                                     host=host):
-        hosts.append(_host_lease(data))
+        # NOTE(cfb): Don't return a lease entry if the IP isn't
+        #            already leased
+        if data['allocated'] and data['leased']:
+            hosts.append(_host_lease(data))
+
     return '\n'.join(hosts)
 
 
@@ -732,6 +739,24 @@ def _add_dnsmasq_accept_rules(dev):
     iptables_manager.apply()
 
 
+def _add_dhcp_mangle_rule(dev):
+    if not os.path.exists('/dev/vhost-net'):
+        return
+    table = iptables_manager.ipv4['mangle']
+    table.add_rule('POSTROUTING',
+                   '-o %s -p udp -m udp --dport 68 -j CHECKSUM '
+                   '--checksum-fill' % dev)
+    iptables_manager.apply()
+
+
+def _remove_dhcp_mangle_rule(dev):
+    table = iptables_manager.ipv4['mangle']
+    table.remove_rule('POSTROUTING',
+                      '-o %s -p udp -m udp --dport 68 -j CHECKSUM '
+                      '--checksum-fill' % dev)
+    iptables_manager.apply()
+
+
 def get_dhcp_opts(context, network_ref):
     """Get network's hosts config in dhcp-opts format."""
     hosts = []
@@ -753,6 +778,7 @@ def get_dhcp_opts(context, network_ref):
                 default_gw_vif[instance_uuid] = vifs[0]['id']
 
         for datum in data:
+            instance_uuid = datum['instance_uuid']
             if instance_uuid in default_gw_vif:
                 # we don't want default gateway for this fixed ip
                 if default_gw_vif[instance_uuid] != datum['vif_id']:
@@ -787,6 +813,8 @@ def kill_dhcp(dev):
         else:
             LOG.debug(_('Pid %d is stale, skip killing dnsmasq'), pid)
 
+    _remove_dhcp_mangle_rule(dev)
+
 
 # NOTE(ja): Sending a HUP only reloads the hostfile, so any
 #           configuration options (like dchp-range, vlan, ...)
@@ -807,6 +835,9 @@ def restart_dhcp(context, dev, network_ref):
         optsfile = _dhcp_file(dev, 'opts')
         write_to_file(optsfile, get_dhcp_opts(context, network_ref))
         os.chmod(optsfile, 0644)
+
+    if network_ref['multi_host']:
+        _add_dhcp_mangle_rule(dev)
 
     # Make sure dnsmasq can actually read it (it setuid()s to "nobody")
     os.chmod(conffile, 0644)
@@ -839,9 +870,10 @@ def restart_dhcp(context, dev, network_ref):
            '--pid-file=%s' % _dhcp_file(dev, 'pid'),
            '--listen-address=%s' % network_ref['dhcp_server'],
            '--except-interface=lo',
-           '--dhcp-range=set:\'%s\',%s,static,%ss' %
+           '--dhcp-range=set:%s,%s,static,%s,%ss' %
                          (network_ref['label'],
                           network_ref['dhcp_start'],
+                          network_ref['netmask'],
                           FLAGS.dhcp_lease_time),
            '--dhcp-lease-max=%s' % len(netaddr.IPNetwork(network_ref['cidr'])),
            '--dhcp-hostsfile=%s' % _dhcp_file(dev, 'conf'),
@@ -902,13 +934,8 @@ interface %s
 
 def _host_lease(data):
     """Return a host string for an address in leasefile format."""
-    if data['instance_updated']:
-        timestamp = data['instance_updated']
-    else:
-        timestamp = data['instance_created']
-
+    timestamp = timeutils.utcnow()
     seconds_since_epoch = calendar.timegm(timestamp.utctimetuple())
-
     return '%d %s %s %s *' % (seconds_since_epoch + FLAGS.dhcp_lease_time,
                               data['vif_address'],
                               data['address'],

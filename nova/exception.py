@@ -157,6 +157,12 @@ class NovaException(Exception):
 
         super(NovaException, self).__init__(message)
 
+    def format_message(self):
+        if self.__class__.__name__.endswith('_Remote'):
+            return self.args[0]
+        else:
+            return unicode(self)
+
 
 class EC2APIError(NovaException):
     message = _("Unknown")
@@ -223,6 +229,20 @@ class InvalidSnapshot(Invalid):
     message = _("Invalid snapshot") + ": %(reason)s"
 
 
+class InvalidBDM(Invalid):
+    message = _("Block Device Mapping is Invalid.")
+
+
+class InvalidBDMSnapshot(InvalidBDM):
+    message = _("Block Device Mapping is Invalid: "
+                "failed to get snapshot %(id)s.")
+
+
+class InvalidBDMVolume(InvalidBDM):
+    message = _("Block Device Mapping is Invalid: "
+                "failed to get volume %(id)s.")
+
+
 class VolumeUnattached(Invalid):
     message = _("Volume %(volume_id)s is not attached to anything")
 
@@ -257,6 +277,10 @@ class InvalidVolume(Invalid):
 
 class InvalidMetadata(Invalid):
     message = _("Invalid metadata") + ": %(reason)s"
+
+
+class InvalidMetadataSize(Invalid):
+    message = _("Invalid metadata size") + ": %(reason)s"
 
 
 class InvalidPortRange(Invalid):
@@ -341,7 +365,7 @@ class ComputeResourcesUnavailable(ServiceUnavailable):
 
 
 class ComputeServiceUnavailable(ServiceUnavailable):
-    message = _("Compute service is unavailable at this time.")
+    message = _("Compute service of %(host)s is unavailable at this time.")
 
 
 class UnableToMigrateToSelf(Invalid):
@@ -369,6 +393,7 @@ class InvalidDevicePath(Invalid):
 
 class DevicePathInUse(Invalid):
     message = _("The supplied device path (%(path)s) is in use.")
+    code = 409
 
 
 class DeviceIsBusy(Invalid):
@@ -644,6 +669,15 @@ class FloatingIpNotFoundForHost(FloatingIpNotFound):
     message = _("Floating ip not found for host %(host)s.")
 
 
+class FloatingIpMultipleFoundForAddress(NovaException):
+    message = _("Multiple floating ips are found for address %(address)s.")
+
+
+class FloatingIpPoolNotFound(NotFound):
+    message = _("Floating ip pool not found.")
+    safe = True
+
+
 class NoMoreFloatingIps(FloatingIpNotFound):
     message = _("Zero floating ips available.")
     safe = True
@@ -663,6 +697,10 @@ class NoFloatingIpsDefined(NotFound):
 
 class NoFloatingIpInterface(NotFound):
     message = _("Interface %(interface)s not found.")
+
+
+class CannotDisassociateAutoAssignedFloatingIP(NovaException):
+    message = _("Cannot disassociate auto assigined floating ip")
 
 
 class KeypairNotFound(NotFound):
@@ -965,6 +1003,10 @@ class VolumeLimitExceeded(QuotaError):
 
 class FloatingIpLimitExceeded(QuotaError):
     message = _("Maximum number of floating ips exceeded")
+
+
+class FixedIpLimitExceeded(QuotaError):
+    message = _("Maximum number of fixed ips exceeded")
 
 
 class MetadataLimitExceeded(QuotaError):

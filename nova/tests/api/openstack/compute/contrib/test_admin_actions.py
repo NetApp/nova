@@ -62,13 +62,6 @@ def fake_compute_api_get(self, context, instance_id):
             'task_state': None}
 
 
-def fake_scheduler_api_live_migration(self, context, dest,
-                                      block_migration=False,
-                                      disk_over_commit=False, instance=None,
-                                      instance_id=None, topic=None):
-    return None
-
-
 class AdminActionsTest(test.TestCase):
 
     _actions = ('pause', 'unpause', 'suspend', 'resume', 'migrate',
@@ -91,9 +84,10 @@ class AdminActionsTest(test.TestCase):
         self.UUID = utils.gen_uuid()
         for _method in self._methods:
             self.stubs.Set(compute.API, _method, fake_compute_api)
-        self.stubs.Set(scheduler_rpcapi.SchedulerAPI,
-                       'live_migration',
-                       fake_scheduler_api_live_migration)
+        self.flags(
+            osapi_compute_extension=[
+                'nova.api.openstack.compute.contrib.select_extensions'],
+            osapi_compute_ext_list=['Admin_actions'])
 
     def test_admin_api_actions(self):
         app = fakes.wsgi_app()
@@ -144,7 +138,16 @@ class AdminActionsTest(test.TestCase):
                         task_state, expected_task_state):
             return None
 
+        def fake_scheduler_api_live_migration(self, context, dest,
+                                        block_migration=False,
+                                        disk_over_commit=False, instance=None,
+                                        instance_id=None, topic=None):
+            return None
+
         self.stubs.Set(compute.API, 'update', fake_update)
+        self.stubs.Set(scheduler_rpcapi.SchedulerAPI,
+                       'live_migration',
+                       fake_scheduler_api_live_migration)
 
         res = req.get_response(app)
         self.assertEqual(res.status_int, 202)
@@ -167,6 +170,44 @@ class AdminActionsTest(test.TestCase):
         req.content_type = 'application/json'
         res = req.get_response(app)
         self.assertEqual(res.status_int, 400)
+
+    def test_migrate_live_compute_service_unavailable(self):
+        ctxt = context.get_admin_context()
+        ctxt.user_id = 'fake'
+        ctxt.project_id = 'fake'
+        ctxt.is_admin = True
+        app = fakes.wsgi_app(fake_auth_context=ctxt)
+        req = webob.Request.blank('/v2/fake/servers/%s/action' % self.UUID)
+        req.method = 'POST'
+        req.body = jsonutils.dumps({
+            'os-migrateLive': {
+                'host': 'hostname',
+                'block_migration': False,
+                'disk_over_commit': False,
+            }
+        })
+        req.content_type = 'application/json'
+
+        def fake_update(inst, context, instance,
+                        task_state, expected_task_state):
+            return None
+
+        def fake_scheduler_api_live_migration(context, dest,
+                                        block_migration=False,
+                                        disk_over_commit=False, instance=None,
+                                        instance_id=None, topic=None):
+            raise exception.ComputeServiceUnavailable(host='host')
+
+        self.stubs.Set(compute.API, 'update', fake_update)
+        self.stubs.Set(scheduler_rpcapi.SchedulerAPI,
+                       'live_migration',
+                       fake_scheduler_api_live_migration)
+
+        res = req.get_response(app)
+        self.assertEqual(res.status_int, 400)
+        self.assertIn(
+            unicode(exception.ComputeServiceUnavailable(host='host')),
+            res.body)
 
 
 class CreateBackupTests(test.TestCase):
@@ -245,6 +286,22 @@ class CreateBackupTests(test.TestCase):
         response = request.get_response(self.app)
         self.assertEqual(response.status_int, 400)
 
+    def test_create_backup_negative_rotation(self):
+        """Rotation must be greater than or equal to zero
+        for backup requests
+        """
+        body = {
+            'createBackup': {
+                'name': 'Backup 1',
+                'backup_type': 'daily',
+                'rotation': -1,
+            },
+        }
+
+        request = self._get_request(body)
+        response = request.get_response(self.app)
+        self.assertEqual(response.status_int, 400)
+
     def test_create_backup_no_backup_type(self):
         """Backup Type (daily or weekly) is required for backup requests"""
         body = {
@@ -265,8 +322,24 @@ class CreateBackupTests(test.TestCase):
         response = request.get_response(self.app)
         self.assertEqual(response.status_int, 400)
 
-    def test_create_backup(self):
-        """The happy path for creating backups"""
+    def test_create_backup_rotation_is_zero(self):
+        """The happy path for creating backups if rotation is zero"""
+        body = {
+            'createBackup': {
+                'name': 'Backup 1',
+                'backup_type': 'daily',
+                'rotation': 0,
+            },
+        }
+
+        request = self._get_request(body)
+        response = request.get_response(self.app)
+
+        self.assertEqual(response.status_int, 202)
+        self.assertFalse('Location' in response.headers)
+
+    def test_create_backup_rotation_is_positive(self):
+        """The happy path for creating backups if rotation is positive"""
         body = {
             'createBackup': {
                 'name': 'Backup 1',
@@ -278,6 +351,7 @@ class CreateBackupTests(test.TestCase):
         request = self._get_request(body)
         response = request.get_response(self.app)
 
+        self.assertEqual(response.status_int, 202)
         self.assertTrue(response.headers['Location'])
 
     def test_create_backup_raises_conflict_on_invalid_state(self):

@@ -148,7 +148,8 @@ libvirt_opts = [
                   'local=nova.virt.libvirt.volume.LibvirtVolumeDriver',
                   'fake=nova.virt.libvirt.volume.LibvirtFakeVolumeDriver',
                   'rbd=nova.virt.libvirt.volume.LibvirtNetVolumeDriver',
-                  'sheepdog=nova.virt.libvirt.volume.LibvirtNetVolumeDriver'
+                  'sheepdog=nova.virt.libvirt.volume.LibvirtNetVolumeDriver',
+                  'nfs=nova.virt.libvirt.volume_nfs.NfsVolumeDriver'
                   ],
                 help='Libvirt handlers for remote volumes.'),
     cfg.StrOpt('libvirt_disk_prefix',
@@ -199,6 +200,8 @@ flags.DECLARE('vncserver_proxyclient_address', 'nova.vnc')
 DEFAULT_FIREWALL_DRIVER = "%s.%s" % (
     libvirt_firewall.__name__,
     libvirt_firewall.IptablesFirewallDriver.__name__)
+
+MAX_CONSOLE_BYTES = 102400
 
 
 def patch_tpool_proxy():
@@ -268,6 +271,7 @@ class LibvirtDriver(driver.ComputeDriver):
         self._host_state = None
         self._initiator = None
         self._wrapped_conn = None
+        self._caps = None
         self.read_only = read_only
         self.firewall_driver = firewall.load_driver(
             default=DEFAULT_FIREWALL_DRIVER,
@@ -352,7 +356,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
     def _test_connection(self):
         try:
-            self._wrapped_conn.getCapabilities()
+            self._wrapped_conn.getLibVersion()
             return True
         except libvirt.libvirtError as e:
             if (e.get_error_code() == libvirt.VIR_ERR_SYSTEM_ERROR and
@@ -648,7 +652,13 @@ class LibvirtDriver(driver.ComputeDriver):
             self._conn.defineXML(domxml)
         else:
             try:
-                flags = (libvirt.VIR_DOMAIN_AFFECT_CURRENT)
+                # NOTE(vish): We can always affect config because our
+                #             domains are persistent, but we should only
+                #             affect live if the domain is running.
+                flags = libvirt.VIR_DOMAIN_AFFECT_CONFIG
+                state = LIBVIRT_POWER_STATE[virt_dom.info()[0]]
+                if state == power_state.RUNNING:
+                    flags |= libvirt.VIR_DOMAIN_AFFECT_LIVE
                 virt_dom.attachDeviceFlags(conf.to_xml(), flags)
             except Exception, ex:
                 if isinstance(ex, libvirt.libvirtError):
@@ -678,24 +688,19 @@ class LibvirtDriver(driver.ComputeDriver):
                     if child.get('dev') == device:
                         return etree.tostring(node)
 
-    def _get_domain_xml(self, instance):
+    def _get_domain_xml(self, instance, network_info, block_device_info=None):
         try:
             virt_dom = self._lookup_by_name(instance['name'])
             xml = virt_dom.XMLDesc(0)
         except exception.InstanceNotFound:
-            instance_dir = os.path.join(FLAGS.instances_path,
-                                        instance['name'])
-            xml_path = os.path.join(instance_dir, 'libvirt.xml')
-            xml = libvirt_utils.load_file(xml_path)
+            xml = self.to_xml(instance, network_info,
+                              block_device_info=block_device_info)
         return xml
 
     @exception.wrap_exception()
     def detach_volume(self, connection_info, instance_name, mountpoint):
         mount_device = mountpoint.rpartition("/")[2]
         try:
-            # NOTE(vish): This is called to cleanup volumes after live
-            #             migration, so we should still logout even if
-            #             the instance doesn't exist here anymore.
             virt_dom = self._lookup_by_name(instance_name)
             xml = self._get_disk_xml(virt_dom.XMLDesc(0), mount_device)
             if not xml:
@@ -709,12 +714,28 @@ class LibvirtDriver(driver.ComputeDriver):
                 domxml = virt_dom.XMLDesc(libvirt.VIR_DOMAIN_XML_SECURE)
                 self._conn.defineXML(domxml)
             else:
-                flags = (libvirt.VIR_DOMAIN_AFFECT_CURRENT)
+                # NOTE(vish): We can always affect config because our
+                #             domains are persistent, but we should only
+                #             affect live if the domain is running.
+                flags = libvirt.VIR_DOMAIN_AFFECT_CONFIG
+                state = LIBVIRT_POWER_STATE[virt_dom.info()[0]]
+                if state == power_state.RUNNING:
+                    flags |= libvirt.VIR_DOMAIN_AFFECT_LIVE
                 virt_dom.detachDeviceFlags(xml, flags)
-        finally:
-            self.volume_driver_method('disconnect_volume',
-                                      connection_info,
-                                      mount_device)
+        except libvirt.libvirtError as ex:
+            # NOTE(vish): This is called to cleanup volumes after live
+            #             migration, so we should still disconnect even if
+            #             the instance doesn't exist here anymore.
+            error_code = ex.get_error_code()
+            if error_code == libvirt.VIR_ERR_NO_DOMAIN:
+                # NOTE(vish):
+                LOG.warn(_("During detach_volume, instance disappeared."))
+            else:
+                raise
+
+        self.volume_driver_method('disconnect_volume',
+                                  connection_info,
+                                  mount_device)
 
     @exception.wrap_exception()
     def _attach_lxc_volume(self, xml, virt_dom, instance_name):
@@ -830,8 +851,11 @@ class LibvirtDriver(driver.ComputeDriver):
         (state, _max_mem, _mem, _cpus, _t) = virt_dom.info()
         state = LIBVIRT_POWER_STATE[state]
 
-        if state == power_state.RUNNING:
-            virt_dom.managedSave(0)
+        # NOTE(dkang): managedSave does not work for LXC
+        if FLAGS.libvirt_type != 'lxc':
+            if state == power_state.RUNNING:
+                virt_dom.managedSave(0)
+
         # Make the snapshot
         libvirt_utils.create_snapshot(disk_path, snapshot_name)
 
@@ -846,8 +870,11 @@ class LibvirtDriver(driver.ComputeDriver):
                                                image_format)
             finally:
                 libvirt_utils.delete_snapshot(disk_path, snapshot_name)
-                if state == power_state.RUNNING:
-                    self._create_domain(domain=virt_dom)
+                # NOTE(dkang): because previous managedSave is not called
+                #              for LXC, _create_domain must not be called.
+                if FLAGS.libvirt_type != 'lxc':
+                    if state == power_state.RUNNING:
+                        self._create_domain(domain=virt_dom)
 
             # Upload that image to the image service
             with libvirt_utils.file_open(out_path) as image_file:
@@ -886,6 +913,7 @@ class LibvirtDriver(driver.ComputeDriver):
         dom = self._lookup_by_name(instance["name"])
         (state, _max_mem, _mem, _cpus, _t) = dom.info()
         state = LIBVIRT_POWER_STATE[state]
+        old_domid = dom.ID()
         # NOTE(vish): This check allows us to reboot an instance that
         #             is already shutdown.
         if state == power_state.RUNNING:
@@ -894,8 +922,10 @@ class LibvirtDriver(driver.ComputeDriver):
         #             FLAG defines depending on how long the get_info
         #             call takes to return.
         for x in xrange(FLAGS.libvirt_wait_soft_reboot_seconds):
+            dom = self._lookup_by_name(instance["name"])
             (state, _max_mem, _mem, _cpus, _t) = dom.info()
             state = LIBVIRT_POWER_STATE[state]
+            new_domid = dom.ID()
 
             if state in [power_state.SHUTDOWN,
                          power_state.CRASHED]:
@@ -904,6 +934,10 @@ class LibvirtDriver(driver.ComputeDriver):
                 self._create_domain(domain=dom)
                 timer = utils.LoopingCall(self._wait_for_running, instance)
                 timer.start(interval=0.5).wait()
+                return True
+            elif old_domid != new_domid:
+                LOG.info(_("Instance may have been rebooted during soft "
+                           "reboot, so return now."), instance=instance)
                 return True
             greenthread.sleep(1)
         return False
@@ -923,7 +957,8 @@ class LibvirtDriver(driver.ComputeDriver):
         """
 
         if not xml:
-            xml = self._get_domain_xml(instance)
+            xml = self._get_domain_xml(instance, network_info,
+                                       block_device_info)
 
         self._destroy(instance)
         self._create_domain_and_network(xml, instance, network_info,
@@ -982,7 +1017,7 @@ class LibvirtDriver(driver.ComputeDriver):
     def resume_state_on_host_boot(self, context, instance, network_info,
                                   block_device_info=None):
         """resume guest state when a host is booted"""
-        xml = self._get_domain_xml(instance)
+        xml = self._get_domain_xml(instance, network_info, block_device_info)
         self._create_domain_and_network(xml, instance, network_info,
                                         block_device_info)
 
@@ -998,7 +1033,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
         """
 
-        unrescue_xml = self._get_domain_xml(instance)
+        unrescue_xml = self._get_domain_xml(instance, network_info)
         unrescue_xml_path = os.path.join(FLAGS.instances_path,
                                          instance['name'],
                                          'unrescue.xml')
@@ -1120,7 +1155,14 @@ class LibvirtDriver(driver.ComputeDriver):
                 if not path:
                     continue
                 libvirt_utils.chown(path, os.getuid())
-                return libvirt_utils.load_file(path)
+
+                with libvirt_utils.file_open(path, 'rb') as fp:
+                    log_data, remaining = utils.last_bytes(fp,
+                                                           MAX_CONSOLE_BYTES)
+                    if remaining > 0:
+                        LOG.info(_('Truncated console log returned, %d bytes '
+                                   'ignored'), remaining, instance=instance)
+                    return log_data
 
         # Try 'pty' types
         if console_types.get('pty'):
@@ -1141,7 +1183,12 @@ class LibvirtDriver(driver.ComputeDriver):
         console_log = self._get_console_log_path(instance['name'])
         fpath = self._append_to_file(data, console_log)
 
-        return libvirt_utils.load_file(fpath)
+        with libvirt_utils.file_open(fpath, 'rb') as fp:
+            log_data, remaining = utils.last_bytes(fp, MAX_CONSOLE_BYTES)
+            if remaining > 0:
+                LOG.info(_('Truncated console log returned, %d bytes ignored'),
+                         remaining, instance=instance)
+            return log_data
 
     @staticmethod
     def get_host_ip_addr():
@@ -1426,12 +1473,12 @@ class LibvirtDriver(driver.ComputeDriver):
                          instance=instance)
 
         if FLAGS.libvirt_type == 'lxc':
-            disk.setup_container(basepath('disk'),
+            disk.setup_container(image('disk').path,
                                  container_dir=container_dir,
                                  use_cow=FLAGS.use_cow_images)
 
         if FLAGS.libvirt_type == 'uml':
-            libvirt_utils.chown(basepath('disk'), 'root')
+            libvirt_utils.chown(image('disk').path, 'root')
 
     @staticmethod
     def _volume_in_mapping(mount_device, block_device_info):
@@ -1454,11 +1501,11 @@ class LibvirtDriver(driver.ComputeDriver):
     def get_host_capabilities(self):
         """Returns an instance of config.LibvirtConfigCaps representing
            the capabilities of the host"""
-        xmlstr = self._conn.getCapabilities()
-
-        caps = config.LibvirtConfigCaps()
-        caps.parse_str(xmlstr)
-        return caps
+        if not self._caps:
+            xmlstr = self._conn.getCapabilities()
+            self._caps = config.LibvirtConfigCaps()
+            self._caps.parse_str(xmlstr)
+        return self._caps
 
     def get_host_cpu_for_guest(self):
         """Returns an instance of config.LibvirtConfigGuestCPU
@@ -1478,6 +1525,7 @@ class LibvirtDriver(driver.ComputeDriver):
         for hostfeat in hostcpu.features:
             guestfeat = config.LibvirtConfigGuestCPUFeature(hostfeat.name)
             guestfeat.policy = "require"
+            guestcpu.features.append(guestfeat)
 
         return guestcpu
 
@@ -1672,7 +1720,8 @@ class LibvirtDriver(driver.ComputeDriver):
         """
         # FIXME(vish): stick this in db
         inst_type_id = instance['instance_type_id']
-        inst_type = instance_types.get_instance_type(inst_type_id)
+        inst_type = instance_types.get_instance_type(inst_type_id,
+                                                     inactive=True)
 
         guest = config.LibvirtConfigGuest()
         guest.virt_type = FLAGS.libvirt_type
@@ -1750,6 +1799,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
         if FLAGS.libvirt_type != "lxc" and FLAGS.libvirt_type != "uml":
             guest.acpi = True
+            guest.apic = True
 
         clk = config.LibvirtConfigGuestClock()
         clk.offset = "utc"
@@ -1899,8 +1949,8 @@ class LibvirtDriver(driver.ComputeDriver):
         """
         devices = []
         for dom_id in self.list_instance_ids():
-            domain = self._conn.lookupByID(dom_id)
             try:
+                domain = self._conn.lookupByID(dom_id)
                 doc = etree.fromstring(domain.XMLDesc(0))
             except Exception:
                 continue
@@ -2367,7 +2417,7 @@ class LibvirtDriver(driver.ComputeDriver):
             raise
 
         if ret <= 0:
-            LOG.error(reason=m % locals())
+            LOG.error(m % locals())
             raise exception.InvalidCPUInfo(reason=m % locals())
 
     def _create_shared_storage_test_file(self):
@@ -2664,6 +2714,12 @@ class LibvirtDriver(driver.ComputeDriver):
 
             if disk_type != 'file':
                 LOG.debug(_('skipping %(path)s since it looks like volume') %
+                          locals())
+                continue
+
+            if not path:
+                LOG.debug(_('skipping disk for %(instance_name)s as it'
+                            ' does not have a path') %
                           locals())
                 continue
 

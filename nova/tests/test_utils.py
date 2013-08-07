@@ -457,6 +457,39 @@ class GenericUtilsTestCase(test.TestCase):
         result = utils.service_is_up(service)
         self.assertFalse(result)
 
+    def test_safe_parse_xml(self):
+
+        normal_body = ("""
+                 <?xml version="1.0" ?><foo>
+                    <bar>
+                        <v1>hey</v1>
+                        <v2>there</v2>
+                    </bar>
+                </foo>""").strip()
+
+        def killer_body():
+            return (("""<!DOCTYPE x [
+                    <!ENTITY a "%(a)s">
+                    <!ENTITY b "%(b)s">
+                    <!ENTITY c "%(c)s">]>
+                <foo>
+                    <bar>
+                        <v1>%(d)s</v1>
+                    </bar>
+                </foo>""") % {
+                'a': 'A' * 10,
+                'b': '&a;' * 10,
+                'c': '&b;' * 10,
+                'd': '&c;' * 9999,
+            }).strip()
+
+        dom = utils.safe_minidom_parse_string(normal_body)
+        self.assertEqual(normal_body, str(dom.toxml()))
+
+        self.assertRaises(ValueError,
+                          utils.safe_minidom_parse_string,
+                          killer_body())
+
     def test_xhtml_escape(self):
         self.assertEqual('&quot;foo&quot;', utils.xhtml_escape('"foo"'))
         self.assertEqual('&apos;foo&apos;', utils.xhtml_escape("'foo'"))
@@ -768,9 +801,57 @@ class DiffDict(test.TestCase):
         self.assertEqual(diff, dict(b=['-']))
 
 
-class EnsureTree(test.TestCase):
-    def test_ensure_tree(self):
-        with utils.tempdir() as tmpdir:
-            testdir = '%s/foo/bar/baz' % (tmpdir,)
-            utils.ensure_tree(testdir)
-            self.assertTrue(os.path.isdir(testdir))
+class MkfsTestCase(test.TestCase):
+
+    @test.skip_test("Skip because utils.mkfs is not available.")
+    def test_mkfs(self):
+        self.mox.StubOutWithMock(utils, 'execute')
+        utils.execute('mkfs', '-t', 'ext4', '-F', '/my/block/dev')
+        utils.execute('mkfs', '-t', 'msdos', '/my/msdos/block/dev')
+        utils.execute('mkswap', '/my/swap/block/dev')
+        self.mox.ReplayAll()
+
+        utils.mkfs('ext4', '/my/block/dev')
+        utils.mkfs('msdos', '/my/msdos/block/dev')
+        utils.mkfs('swap', '/my/swap/block/dev')
+
+    @test.skip_test("Skip because utils.mkfs is not available.")
+    def test_mkfs_with_label(self):
+        self.mox.StubOutWithMock(utils, 'execute')
+        utils.execute('mkfs', '-t', 'ext4', '-F',
+                      '-L', 'ext4-vol', '/my/block/dev')
+        utils.execute('mkfs', '-t', 'msdos',
+                      '-n', 'msdos-vol', '/my/msdos/block/dev')
+        utils.execute('mkswap', '-L', 'swap-vol', '/my/swap/block/dev')
+        self.mox.ReplayAll()
+
+        utils.mkfs('ext4', '/my/block/dev', 'ext4-vol')
+        utils.mkfs('msdos', '/my/msdos/block/dev', 'msdos-vol')
+        utils.mkfs('swap', '/my/swap/block/dev', 'swap-vol')
+
+
+class LastBytesTestCase(test.TestCase):
+    """Test the last_bytes() utility method."""
+
+    def setUp(self):
+        super(LastBytesTestCase, self).setUp()
+        self.f = StringIO.StringIO('1234567890')
+
+    def test_truncated(self):
+        self.f.seek(0, os.SEEK_SET)
+        out, remaining = utils.last_bytes(self.f, 5)
+        self.assertEqual(out, '67890')
+        self.assertTrue(remaining > 0)
+
+    def test_read_all(self):
+        self.f.seek(0, os.SEEK_SET)
+        out, remaining = utils.last_bytes(self.f, 1000)
+        self.assertEqual(out, '1234567890')
+        self.assertFalse(remaining > 0)
+
+    def test_seek_too_far_real_file(self):
+        # StringIO doesn't raise IOError if you see past the start of the file.
+        flo = tempfile.TemporaryFile()
+        content = '1234567890'
+        flo.write(content)
+        self.assertEqual((content, 0), utils.last_bytes(flo, 1000))

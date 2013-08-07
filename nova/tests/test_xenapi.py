@@ -1690,8 +1690,9 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
         network_model = fake_network.fake_get_instance_nw_info(self.stubs,
                                                       1, spectacular=True)
 
-        fake_network.stub_out_nw_api_get_instance_nw_info(self.stubs,
-                                      lambda *a, **kw: network_model)
+        from nova.compute import utils as compute_utils
+        self.stubs.Set(compute_utils, 'get_nw_info_for_instance',
+                       lambda instance: network_model)
 
         network_info = network_model.legacy()
         self.fw.prepare_instance_filter(instance_ref, network_info)
@@ -1743,8 +1744,10 @@ class XenAPIDom0IptablesFirewallTestCase(stubs.XenAPITestBase):
         ipv6 = self.fw.iptables.ipv6['filter'].rules
         ipv4_network_rules = len(ipv4) - len(inst_ipv4) - ipv4_len
         ipv6_network_rules = len(ipv6) - len(inst_ipv6) - ipv6_len
-        self.assertEquals(ipv4_network_rules,
-                  ipv4_rules_per_addr * ipv4_addr_per_network * networks_count)
+        # Extra rules are for the DHCP request
+        rules = (ipv4_rules_per_addr * ipv4_addr_per_network *
+                 networks_count) + 2
+        self.assertEquals(ipv4_network_rules, rules)
         self.assertEquals(ipv6_network_rules,
                   ipv6_rules_per_addr * ipv6_addr_per_network * networks_count)
 

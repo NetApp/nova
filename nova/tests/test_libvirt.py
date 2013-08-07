@@ -571,6 +571,7 @@ class LibvirtConnTestCase(test.TestCase):
                                     _fake_network_info(self.stubs, 1),
                                     None, None)
         self.assertEquals(cfg.acpi, True)
+        self.assertEquals(cfg.apic, True)
         self.assertEquals(cfg.memory, 1024 * 1024 * 2)
         self.assertEquals(cfg.vcpus, 1)
         self.assertEquals(cfg.os_type, vm_mode.HVM)
@@ -815,6 +816,9 @@ class LibvirtConnTestCase(test.TestCase):
             cpu.model = "Opteron_G4"
             cpu.vendor = "AMD"
 
+            cpu.features.append(config.LibvirtConfigGuestCPUFeature("tm2"))
+            cpu.features.append(config.LibvirtConfigGuestCPUFeature("ht"))
+
             caps = config.LibvirtConfigCaps()
             caps.host = config.LibvirtConfigCapsHost()
             caps.host.cpu = cpu
@@ -838,6 +842,9 @@ class LibvirtConnTestCase(test.TestCase):
         self.assertEquals(conf.cpu.mode, None)
         self.assertEquals(conf.cpu.model, "Opteron_G4")
         self.assertEquals(conf.cpu.vendor, "AMD")
+        self.assertEquals(len(conf.cpu.features), 2)
+        self.assertEquals(conf.cpu.features[0].name, "tm2")
+        self.assertEquals(conf.cpu.features[1].name, "ht")
 
     def test_get_guest_cpu_config_custom_old(self):
         def get_lib_version_stub(self):
@@ -1141,6 +1148,45 @@ class LibvirtConnTestCase(test.TestCase):
         self.assertEquals(snapshot['disk_format'], 'ami')
         self.assertEquals(snapshot['name'], snapshot_name)
 
+    def test_lxc_snapshot_in_ami_format(self):
+        self.flags(libvirt_snapshots_directory='./',
+                   libvirt_type='lxc')
+
+        # Start test
+        image_service = nova.tests.image.fake.FakeImageService()
+
+        # Assign different image_ref from nova/images/fakes for testing ami
+        test_instance = copy.deepcopy(self.test_instance)
+        test_instance["image_ref"] = 'c905cedb-7281-47e4-8a62-f26bc5fc4c77'
+
+        # Assuming that base image already exists in image_service
+        instance_ref = db.instance_create(self.context, test_instance)
+        properties = {'instance_id': instance_ref['id'],
+                      'user_id': str(self.context.user_id)}
+        snapshot_name = 'test-snap'
+        sent_meta = {'name': snapshot_name, 'is_public': False,
+                     'status': 'creating', 'properties': properties}
+        # Create new image. It will be updated in snapshot method
+        # To work with it from snapshot, the single image_service is needed
+        recv_meta = image_service.create(context, sent_meta)
+
+        self.mox.StubOutWithMock(libvirt_driver.LibvirtDriver, '_conn')
+        libvirt_driver.LibvirtDriver._conn.lookupByName = self.fake_lookup
+        self.mox.StubOutWithMock(libvirt_driver.utils, 'execute')
+        libvirt_driver.utils.execute = self.fake_execute
+        libvirt_driver.libvirt_utils.disk_type = "qcow2"
+
+        self.mox.ReplayAll()
+
+        conn = libvirt_driver.LibvirtDriver(False)
+        conn.snapshot(self.context, instance_ref, recv_meta['id'])
+
+        snapshot = image_service.show(context, recv_meta['id'])
+        self.assertEquals(snapshot['properties']['image_state'], 'available')
+        self.assertEquals(snapshot['status'], 'active')
+        self.assertEquals(snapshot['disk_format'], 'ami')
+        self.assertEquals(snapshot['name'], snapshot_name)
+
     def test_snapshot_in_raw_format(self):
         self.flags(libvirt_snapshots_directory='./')
 
@@ -1162,6 +1208,46 @@ class LibvirtConnTestCase(test.TestCase):
         libvirt_driver.LibvirtDriver._conn.lookupByName = self.fake_lookup
         self.mox.StubOutWithMock(libvirt_driver.utils, 'execute')
         libvirt_driver.utils.execute = self.fake_execute
+
+        self.mox.ReplayAll()
+
+        conn = libvirt_driver.LibvirtDriver(False)
+        conn.snapshot(self.context, instance_ref, recv_meta['id'])
+
+        snapshot = image_service.show(context, recv_meta['id'])
+        self.assertEquals(snapshot['properties']['image_state'], 'available')
+        self.assertEquals(snapshot['status'], 'active')
+        self.assertEquals(snapshot['disk_format'], 'raw')
+        self.assertEquals(snapshot['name'], snapshot_name)
+
+    def test_lxc_snapshot_in_raw_format(self):
+        self.flags(libvirt_snapshots_directory='./',
+                   libvirt_type='lxc')
+
+        # Start test
+        image_service = nova.tests.image.fake.FakeImageService()
+
+        # Assuming that base image already exists in image_service
+        instance_ref = db.instance_create(self.context, self.test_instance)
+        properties = {'instance_id': instance_ref['id'],
+                      'user_id': str(self.context.user_id)}
+        snapshot_name = 'test-snap'
+        sent_meta = {'name': snapshot_name, 'is_public': False,
+                     'status': 'creating', 'properties': properties}
+        # Create new image. It will be updated in snapshot method
+        # To work with it from snapshot, the single image_service is needed
+        recv_meta = image_service.create(context, sent_meta)
+
+        self.mox.StubOutWithMock(libvirt_driver.LibvirtDriver, '_conn')
+        libvirt_driver.LibvirtDriver._conn.lookupByName = self.fake_lookup
+        self.mox.StubOutWithMock(libvirt_driver.utils, 'execute')
+        libvirt_driver.utils.execute = self.fake_execute
+        self.stubs.Set(libvirt_driver.libvirt_utils, 'disk_type', 'raw')
+
+        def convert_image(source, dest, out_format):
+            libvirt_driver.libvirt_utils.files[dest] = ''
+
+        images.convert_image = convert_image
 
         self.mox.ReplayAll()
 
@@ -1196,6 +1282,42 @@ class LibvirtConnTestCase(test.TestCase):
         libvirt_driver.LibvirtDriver._conn.lookupByName = self.fake_lookup
         self.mox.StubOutWithMock(libvirt_driver.utils, 'execute')
         libvirt_driver.utils.execute = self.fake_execute
+
+        self.mox.ReplayAll()
+
+        conn = libvirt_driver.LibvirtDriver(False)
+        conn.snapshot(self.context, instance_ref, recv_meta['id'])
+
+        snapshot = image_service.show(context, recv_meta['id'])
+        self.assertEquals(snapshot['properties']['image_state'], 'available')
+        self.assertEquals(snapshot['status'], 'active')
+        self.assertEquals(snapshot['disk_format'], 'qcow2')
+        self.assertEquals(snapshot['name'], snapshot_name)
+
+    def test_lxc_snapshot_in_qcow2_format(self):
+        self.flags(snapshot_image_format='qcow2',
+                   libvirt_snapshots_directory='./',
+                   libvirt_type='lxc')
+
+        # Start test
+        image_service = nova.tests.image.fake.FakeImageService()
+
+        # Assuming that base image already exists in image_service
+        instance_ref = db.instance_create(self.context, self.test_instance)
+        properties = {'instance_id': instance_ref['id'],
+                      'user_id': str(self.context.user_id)}
+        snapshot_name = 'test-snap'
+        sent_meta = {'name': snapshot_name, 'is_public': False,
+                     'status': 'creating', 'properties': properties}
+        # Create new image. It will be updated in snapshot method
+        # To work with it from snapshot, the single image_service is needed
+        recv_meta = image_service.create(context, sent_meta)
+
+        self.mox.StubOutWithMock(libvirt_driver.LibvirtDriver, '_conn')
+        libvirt_driver.LibvirtDriver._conn.lookupByName = self.fake_lookup
+        self.mox.StubOutWithMock(libvirt_driver.utils, 'execute')
+        libvirt_driver.utils.execute = self.fake_execute
+        libvirt_driver.libvirt_utils.disk_type = "qcow2"
 
         self.mox.ReplayAll()
 
@@ -1245,8 +1367,80 @@ class LibvirtConnTestCase(test.TestCase):
         self.assertEquals(snapshot['status'], 'active')
         self.assertEquals(snapshot['name'], snapshot_name)
 
+    def test_lxc_snapshot_no_image_architecture(self):
+        self.flags(libvirt_snapshots_directory='./',
+                   libvirt_type='lxc')
+
+        # Start test
+        image_service = nova.tests.image.fake.FakeImageService()
+
+        # Assign different image_ref from nova/images/fakes for
+        # testing different base image
+        test_instance = copy.deepcopy(self.test_instance)
+        test_instance["image_ref"] = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
+
+        # Assuming that base image already exists in image_service
+        instance_ref = db.instance_create(self.context, test_instance)
+        properties = {'instance_id': instance_ref['id'],
+                      'user_id': str(self.context.user_id)}
+        snapshot_name = 'test-snap'
+        sent_meta = {'name': snapshot_name, 'is_public': False,
+                     'status': 'creating', 'properties': properties}
+        # Create new image. It will be updated in snapshot method
+        # To work with it from snapshot, the single image_service is needed
+        recv_meta = image_service.create(context, sent_meta)
+
+        self.mox.StubOutWithMock(libvirt_driver.LibvirtDriver, '_conn')
+        libvirt_driver.LibvirtDriver._conn.lookupByName = self.fake_lookup
+        self.mox.StubOutWithMock(libvirt_driver.utils, 'execute')
+        libvirt_driver.utils.execute = self.fake_execute
+
+        self.mox.ReplayAll()
+
+        conn = libvirt_driver.LibvirtDriver(False)
+        conn.snapshot(self.context, instance_ref, recv_meta['id'])
+
+        snapshot = image_service.show(context, recv_meta['id'])
+        self.assertEquals(snapshot['properties']['image_state'], 'available')
+        self.assertEquals(snapshot['status'], 'active')
+        self.assertEquals(snapshot['name'], snapshot_name)
+
     def test_snapshot_no_original_image(self):
         self.flags(libvirt_snapshots_directory='./')
+
+        # Start test
+        image_service = nova.tests.image.fake.FakeImageService()
+
+        # Assign a non-existent image
+        test_instance = copy.deepcopy(self.test_instance)
+        test_instance["image_ref"] = '661122aa-1234-dede-fefe-babababababa'
+
+        instance_ref = db.instance_create(self.context, test_instance)
+        properties = {'instance_id': instance_ref['id'],
+                      'user_id': str(self.context.user_id)}
+        snapshot_name = 'test-snap'
+        sent_meta = {'name': snapshot_name, 'is_public': False,
+                     'status': 'creating', 'properties': properties}
+        recv_meta = image_service.create(context, sent_meta)
+
+        self.mox.StubOutWithMock(libvirt_driver.LibvirtDriver, '_conn')
+        libvirt_driver.LibvirtDriver._conn.lookupByName = self.fake_lookup
+        self.mox.StubOutWithMock(libvirt_driver.utils, 'execute')
+        libvirt_driver.utils.execute = self.fake_execute
+
+        self.mox.ReplayAll()
+
+        conn = libvirt_driver.LibvirtDriver(False)
+        conn.snapshot(self.context, instance_ref, recv_meta['id'])
+
+        snapshot = image_service.show(context, recv_meta['id'])
+        self.assertEquals(snapshot['properties']['image_state'], 'available')
+        self.assertEquals(snapshot['status'], 'active')
+        self.assertEquals(snapshot['name'], snapshot_name)
+
+    def test_lxc_snapshot_no_original_image(self):
+        self.flags(libvirt_snapshots_directory='./',
+                   libvirt_type='lxc')
 
         # Start test
         image_service = nova.tests.image.fake.FakeImageService()
@@ -2027,6 +2221,7 @@ class LibvirtConnTestCase(test.TestCase):
                                        FLAGS.base_dir_name))
 
     def test_get_console_output_file(self):
+        fake_libvirt_utils.files['console.log'] = '01234567890'
 
         with utils.tempdir() as tmpdir:
             self.flags(instances_path=tmpdir)
@@ -2036,11 +2231,7 @@ class LibvirtConnTestCase(test.TestCase):
             instance = db.instance_create(self.context, instance_ref)
 
             console_dir = (os.path.join(tmpdir, instance['name']))
-            os.mkdir(console_dir)
             console_log = '%s/console.log' % (console_dir)
-            f = open(console_log, "w")
-            f.write("foo")
-            f.close()
             fake_dom_xml = """
                 <domain type='kvm'>
                     <devices>
@@ -2063,10 +2254,18 @@ class LibvirtConnTestCase(test.TestCase):
             libvirt_driver.libvirt_utils = fake_libvirt_utils
 
             conn = libvirt_driver.LibvirtDriver(False)
-            output = conn.get_console_output(instance)
-            self.assertEquals("foo", output)
+
+            try:
+                prev_max = libvirt_driver.MAX_CONSOLE_BYTES
+                libvirt_driver.MAX_CONSOLE_BYTES = 5
+                output = conn.get_console_output(instance)
+            finally:
+                libvirt_driver.MAX_CONSOLE_BYTES = prev_max
+
+            self.assertEquals('67890', output)
 
     def test_get_console_output_pty(self):
+        fake_libvirt_utils.files['pty'] = '01234567890'
 
         with utils.tempdir() as tmpdir:
             self.flags(instances_path=tmpdir)
@@ -2076,11 +2275,7 @@ class LibvirtConnTestCase(test.TestCase):
             instance = db.instance_create(self.context, instance_ref)
 
             console_dir = (os.path.join(tmpdir, instance['name']))
-            os.mkdir(console_dir)
             pty_file = '%s/fake_pty' % (console_dir)
-            f = open(pty_file, "w")
-            f.write("foo")
-            f.close()
             fake_dom_xml = """
                 <domain type='kvm'>
                     <devices>
@@ -2099,17 +2294,27 @@ class LibvirtConnTestCase(test.TestCase):
                 return FakeVirtDomain(fake_dom_xml)
 
             def _fake_flush(self, fake_pty):
-                with open(fake_pty, 'r') as fp:
-                    return fp.read()
+                return 'foo'
+
+            def _fake_append_to_file(self, data, fpath):
+                return 'pty'
 
             self.create_fake_libvirt_mock()
             libvirt_driver.LibvirtDriver._conn.lookupByName = fake_lookup
             libvirt_driver.LibvirtDriver._flush_libvirt_console = _fake_flush
+            libvirt_driver.LibvirtDriver._append_to_file = _fake_append_to_file
             libvirt_driver.libvirt_utils = fake_libvirt_utils
 
             conn = libvirt_driver.LibvirtDriver(False)
-            output = conn.get_console_output(instance)
-            self.assertEquals("foo", output)
+
+            try:
+                prev_max = libvirt_driver.MAX_CONSOLE_BYTES
+                libvirt_driver.MAX_CONSOLE_BYTES = 5
+                output = conn.get_console_output(instance)
+            finally:
+                libvirt_driver.MAX_CONSOLE_BYTES = prev_max
+
+            self.assertEquals('67890', output)
 
     def test_get_host_ip_addr(self):
         conn = libvirt_driver.LibvirtDriver(False)
@@ -2124,11 +2329,11 @@ class LibvirtConnTestCase(test.TestCase):
             conn = libvirt_driver.LibvirtDriver(False)
 
             self.mox.StubOutWithMock(conn, "_wrapped_conn")
-            self.mox.StubOutWithMock(conn._wrapped_conn, "getCapabilities")
+            self.mox.StubOutWithMock(conn._wrapped_conn, "getLibVersion")
             self.mox.StubOutWithMock(libvirt.libvirtError, "get_error_code")
             self.mox.StubOutWithMock(libvirt.libvirtError, "get_error_domain")
 
-            conn._wrapped_conn.getCapabilities().AndRaise(
+            conn._wrapped_conn.getLibVersion().AndRaise(
                     libvirt.libvirtError("fake failure"))
 
             libvirt.libvirtError.get_error_code().AndReturn(error)
@@ -2901,6 +3106,20 @@ class IptablesFirewallTestCase(test.TestCase):
       ':POSTROUTING ACCEPT [5063:386098]',
     ]
 
+    in_mangle_rules = [
+        '# Generated by iptables-save v1.4.12 on Tue Dec 18 15:50:25 201;',
+        '*mangle',
+        ':PREROUTING ACCEPT [241:39722]',
+        ':INPUT ACCEPT [230:39282]',
+        ':FORWARD ACCEPT [0:0]',
+        ':OUTPUT ACCEPT [266:26558]',
+        ':POSTROUTING ACCEPT [267:26590]',
+        '-A POSTROUTING -o virbr0 -p udp -m udp --dport 68 -j CHECKSUM '
+        '--checksum-fill',
+        'COMMIT',
+        '# Completed on Tue Dec 18 15:50:25 2012',
+    ]
+
     in_filter_rules = [
       '# Generated by iptables-save v1.4.4 on Mon Dec  6 11:54:13 2010',
       '*filter',
@@ -3002,6 +3221,8 @@ class IptablesFirewallTestCase(test.TestCase):
                 return '\n'.join(self.in_filter_rules), None
             if cmd == ('iptables-save', '-c', '-t', 'nat'):
                 return '\n'.join(self.in_nat_rules), None
+            if cmd == ('iptables-save', '-c', '-t', 'mangle'):
+                return '\n'.join(self.in_mangle_rules), None
             if cmd == ('iptables-restore', '-c',):
                 lines = process_input.split('\n')
                 if '*filter' in lines:
@@ -3019,7 +3240,9 @@ class IptablesFirewallTestCase(test.TestCase):
         from nova.network import linux_net
         linux_net.iptables_manager.execute = fake_iptables_execute
 
-        _fake_stub_out_get_nw_info(self.stubs, lambda *a, **kw: network_model)
+        from nova.compute import utils as compute_utils
+        self.stubs.Set(compute_utils, 'get_nw_info_for_instance',
+                       lambda instance: network_model)
 
         network_info = network_model.legacy()
         self.fw.prepare_instance_filter(instance_ref, network_info)
@@ -3110,8 +3333,10 @@ class IptablesFirewallTestCase(test.TestCase):
         ipv6 = self.fw.iptables.ipv6['filter'].rules
         ipv4_network_rules = len(ipv4) - len(inst_ipv4) - ipv4_len
         ipv6_network_rules = len(ipv6) - len(inst_ipv6) - ipv6_len
-        self.assertEquals(ipv4_network_rules,
-                  ipv4_rules_per_addr * ipv4_addr_per_network * networks_count)
+        # Extra rules are for the DHCP request
+        rules = (ipv4_rules_per_addr * ipv4_addr_per_network *
+                 networks_count) + 2
+        self.assertEquals(ipv4_network_rules, rules)
         self.assertEquals(ipv6_network_rules,
                   ipv6_rules_per_addr * ipv6_addr_per_network * networks_count)
 
@@ -3589,6 +3814,79 @@ disk size: 4.4M''', ''))
         self.mox.ReplayAll()
         libvirt_utils.fetch_image(context, target, image_id,
                                   user_id, project_id)
+
+    def test_fetch_raw_image(self):
+
+        def fake_execute(*cmd, **kwargs):
+            self.executes.append(cmd)
+            return None, None
+
+        def fake_rename(old, new):
+            self.executes.append(('mv', old, new))
+
+        def fake_unlink(path):
+            self.executes.append(('rm', path))
+
+        def fake_rm_on_errror(path):
+            self.executes.append(('rm', '-f', path))
+
+        def fake_qemu_img_info(path):
+            class FakeImgInfo(object):
+                def get(self, attr):
+                    return getattr(self, attr.replace(' ', '_'), None)
+                pass
+
+            file_format = path.split('.')[-1]
+            if file_format == 'part':
+                file_format = path.split('.')[-2]
+            elif file_format == 'converted':
+                file_format = 'raw'
+            if 'backing' in path:
+                backing_file = 'backing'
+            else:
+                backing_file = None
+
+            FakeImgInfo.file_format = file_format
+            FakeImgInfo.backing_file = backing_file
+
+            return FakeImgInfo()
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        self.stubs.Set(os, 'rename', fake_rename)
+        self.stubs.Set(os, 'unlink', fake_unlink)
+        self.stubs.Set(images, 'fetch', lambda *_: None)
+        self.stubs.Set(images, 'qemu_img_info', fake_qemu_img_info)
+        self.stubs.Set(utils, 'delete_if_exists', fake_rm_on_errror)
+
+        context = 'opaque context'
+        image_id = '4'
+        user_id = 'fake'
+        project_id = 'fake'
+
+        target = 't.qcow2'
+        self.executes = []
+        expected_commands = [('qemu-img', 'convert', '-O', 'raw',
+                              't.qcow2.part', 't.qcow2.converted'),
+                             ('rm', 't.qcow2.part'),
+                             ('mv', 't.qcow2.converted', 't.qcow2')]
+        images.fetch_to_raw(context, image_id, target, user_id, project_id)
+        self.assertEqual(self.executes, expected_commands)
+
+        target = 't.raw'
+        self.executes = []
+        expected_commands = [('mv', 't.raw.part', 't.raw')]
+        images.fetch_to_raw(context, image_id, target, user_id, project_id)
+        self.assertEqual(self.executes, expected_commands)
+
+        target = 'backing.qcow2'
+        self.executes = []
+        expected_commands = [('rm', '-f', 'backing.qcow2.part')]
+        self.assertRaises(exception.ImageUnacceptable,
+                          images.fetch_to_raw,
+                          context, image_id, target, user_id, project_id)
+        self.assertEqual(self.executes, expected_commands)
+
+        del self.executes
 
     def test_get_disk_backing_file(self):
         with_actual_path = False

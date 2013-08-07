@@ -73,6 +73,8 @@ VIR_DOMAIN_XML_SECURE = 1
 VIR_DOMAIN_UNDEFINE_MANAGED_SAVE = 1
 
 VIR_DOMAIN_AFFECT_CURRENT = 0
+VIR_DOMAIN_AFFECT_LIVE = 1
+VIR_DOMAIN_AFFECT_CONFIG = 2
 
 VIR_CPU_COMPARE_ERROR = -1
 VIR_CPU_COMPARE_INCOMPATIBLE = 0
@@ -177,6 +179,7 @@ class Domain(object):
         self._def = self._parse_definition(xml)
         self._has_saved_state = False
         self._snapshots = {}
+        self._id = self._connection._id_counter
 
     def _parse_definition(self, xml):
         try:
@@ -297,6 +300,9 @@ class Domain(object):
         self._state = VIR_DOMAIN_SHUTOFF
         self._connection._mark_not_running(self)
 
+    def ID(self):
+        return self._id
+
     def name(self):
         return self._def['name']
 
@@ -337,7 +343,10 @@ class Domain(object):
         self._def['devices']['disks'] += [disk_info]
         return True
 
-    def attachDeviceFlags(self, xml, _flags):
+    def attachDeviceFlags(self, xml, flags):
+        if (flags & VIR_DOMAIN_AFFECT_LIVE and
+            self._state != VIR_DOMAIN_RUNNING):
+            raise libvirtError("AFFECT_LIVE only allowed for running domains!")
         self.attachDevice(xml)
 
     def detachDevice(self, xml):
@@ -510,6 +519,8 @@ class Connection(object):
     def _mark_not_running(self, dom):
         if dom._transient:
             self._undefine(dom)
+
+        dom._id = -1
 
         for (k, v) in self._running_vms.iteritems():
             if v == dom:

@@ -30,6 +30,7 @@ from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import rpc
 import nova.policy
+from nova import quota
 from nova import test
 from nova.tests import fake_network
 from nova import utils
@@ -278,6 +279,7 @@ class FlatNetworkTestCase(test.TestCase):
         self.mox.StubOutWithMock(db,
                               'virtual_interface_get_by_instance_and_network')
         self.mox.StubOutWithMock(db, 'fixed_ip_update')
+        self.mox.StubOutWithMock(quota.QUOTAS, 'reserve')
 
         db.fixed_ip_update(mox.IgnoreArg(),
                            mox.IgnoreArg(),
@@ -291,6 +293,10 @@ class FlatNetworkTestCase(test.TestCase):
         db.instance_get(mox.IgnoreArg(),
                         mox.IgnoreArg()).AndReturn({'security_groups':
                                                              [{'id': 0}]})
+
+        quota.QUOTAS.reserve(mox.IgnoreArg(),
+                             fixed_ips=mox.IgnoreArg()).AndReturn(None)
+
         db.fixed_ip_associate_pool(mox.IgnoreArg(),
                                    mox.IgnoreArg(),
                                    mox.IgnoreArg()).AndReturn('192.168.0.101')
@@ -310,6 +316,7 @@ class FlatNetworkTestCase(test.TestCase):
         self.mox.StubOutWithMock(db,
                               'virtual_interface_get_by_instance_and_network')
         self.mox.StubOutWithMock(db, 'fixed_ip_update')
+        self.mox.StubOutWithMock(quota.QUOTAS, 'reserve')
 
         db.fixed_ip_update(mox.IgnoreArg(),
                            mox.IgnoreArg(),
@@ -323,6 +330,10 @@ class FlatNetworkTestCase(test.TestCase):
         db.instance_get(mox.IgnoreArg(),
                         mox.IgnoreArg()).AndReturn({'security_groups':
                                                              [{'id': 0}]})
+
+        quota.QUOTAS.reserve(mox.IgnoreArg(),
+                             fixed_ips=mox.IgnoreArg()).AndReturn(None)
+
         db.fixed_ip_associate_pool(mox.IgnoreArg(),
                                    mox.IgnoreArg(),
                                    mox.IgnoreArg()).AndReturn('192.168.0.101')
@@ -376,6 +387,7 @@ class FlatNetworkTestCase(test.TestCase):
         self.mox.StubOutWithMock(db,
                               'virtual_interface_get_by_instance_and_network')
         self.mox.StubOutWithMock(db, 'fixed_ip_update')
+        self.mox.StubOutWithMock(quota.QUOTAS, 'reserve')
 
         db.fixed_ip_update(mox.IgnoreArg(),
                            mox.IgnoreArg(),
@@ -389,6 +401,9 @@ class FlatNetworkTestCase(test.TestCase):
         db.instance_get(mox.IgnoreArg(),
                         mox.IgnoreArg()).AndReturn({'security_groups':
                                                              [{'id': 0}]})
+
+        quota.QUOTAS.reserve(mox.IgnoreArg(),
+                             fixed_ips=mox.IgnoreArg()).AndReturn(None)
 
         db.fixed_ip_associate_pool(mox.IgnoreArg(),
                                    mox.IgnoreArg(),
@@ -639,7 +654,7 @@ class VlanNetworkTestCase(test.TestCase):
                                       is_admin=False)
 
         def fake1(*args, **kwargs):
-            pass
+            return '10.0.0.1'
 
         # floating ip that's already associated
         def fake2(*args, **kwargs):
@@ -827,6 +842,14 @@ class VlanNetworkTestCase(test.TestCase):
         def fake7(*args, **kwargs):
             self.local = True
 
+        def fake8(*args, **kwargs):
+            return {'address': '10.0.0.1',
+                    'pool': 'nova',
+                    'interface': 'eth0',
+                    'fixed_ip_id': 1,
+                    'auto_assigned': True,
+                    'project_id': ctxt.project_id}
+
         self.stubs.Set(self.network, '_floating_ip_owned_by_project', fake1)
 
         # raises because floating_ip is not associated to a fixed_ip
@@ -853,6 +876,13 @@ class VlanNetworkTestCase(test.TestCase):
         self.stubs.Set(self.network, '_disassociate_floating_ip', fake7)
         self.network.disassociate_floating_ip(ctxt, mox.IgnoreArg())
         self.assertTrue(self.local)
+
+        # raises because auto_assigned floating IP cannot be disassociated
+        self.stubs.Set(self.network.db, 'floating_ip_get_by_address', fake8)
+        self.assertRaises(exception.CannotDisassociateAutoAssignedFloatingIP,
+                          self.network.disassociate_floating_ip,
+                          ctxt,
+                          mox.IgnoreArg())
 
     def test_add_fixed_ip_instance_without_vpn_requested_networks(self):
         self.mox.StubOutWithMock(db, 'network_get')

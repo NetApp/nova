@@ -303,7 +303,8 @@ def floating_ip_destroy(context, address):
 def floating_ip_disassociate(context, address):
     """Disassociate a floating ip from a fixed ip by address.
 
-    :returns: the address of the existing fixed ip.
+    :returns: the address of the previous fixed ip or None
+              if the ip was not associated to an ip.
 
     """
     return IMPL.floating_ip_disassociate(context, address)
@@ -311,7 +312,12 @@ def floating_ip_disassociate(context, address):
 
 def floating_ip_fixed_ip_associate(context, floating_address,
                                    fixed_address, host):
-    """Associate a floating ip to a fixed_ip by address."""
+    """Associate a floating ip to a fixed_ip by address.
+
+    :returns: the address of the new fixed ip (fixed_address) or None
+              if the ip was already associated to the fixed ip.
+    """
+
     return IMPL.floating_ip_fixed_ip_associate(context,
                                                floating_address,
                                                fixed_address,
@@ -500,6 +506,12 @@ def fixed_ip_get_network(context, address):
 def fixed_ip_update(context, address, values):
     """Create a fixed ip from the values dictionary."""
     return IMPL.fixed_ip_update(context, address, values)
+
+
+def fixed_ip_count_by_project(context, project_id, session=None):
+    """Count fixed ips used by project."""
+    return IMPL.fixed_ip_count_by_project(context, project_id,
+                                          session=session)
 
 ####################
 
@@ -1448,9 +1460,9 @@ def instance_type_get_by_name(context, name):
     return IMPL.instance_type_get_by_name(context, name)
 
 
-def instance_type_get_by_flavor_id(context, id):
+def instance_type_get_by_flavor_id(context, id, read_deleted=None):
     """Get instance type by flavor id."""
-    return IMPL.instance_type_get_by_flavor_id(context, id)
+    return IMPL.instance_type_get_by_flavor_id(context, id, read_deleted)
 
 
 def instance_type_destroy(context, name):

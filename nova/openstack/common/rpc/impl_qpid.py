@@ -23,6 +23,7 @@ import uuid
 
 import eventlet
 import greenlet
+import qpid.codec010 as qpid_codec
 import qpid.messaging
 import qpid.messaging.exceptions
 
@@ -50,24 +51,6 @@ qpid_opts = [
     cfg.StrOpt('qpid_sasl_mechanisms',
                default='',
                help='Space separated list of SASL mechanisms to use for auth'),
-    cfg.BoolOpt('qpid_reconnect',
-                default=True,
-                help='Automatically reconnect'),
-    cfg.IntOpt('qpid_reconnect_timeout',
-               default=0,
-               help='Reconnection timeout in seconds'),
-    cfg.IntOpt('qpid_reconnect_limit',
-               default=0,
-               help='Max reconnections before giving up'),
-    cfg.IntOpt('qpid_reconnect_interval_min',
-               default=0,
-               help='Minimum seconds between reconnection attempts'),
-    cfg.IntOpt('qpid_reconnect_interval_max',
-               default=0,
-               help='Maximum seconds between reconnection attempts'),
-    cfg.IntOpt('qpid_reconnect_interval',
-               default=0,
-               help='Equivalent to setting max and min to the same value'),
     cfg.IntOpt('qpid_heartbeat',
                default=60,
                help='Seconds between connection keepalive heartbeats'),
@@ -80,6 +63,8 @@ qpid_opts = [
 ]
 
 cfg.CONF.register_opts(qpid_opts)
+
+JSON_CONTENT_TYPE = 'application/json; charset=utf8'
 
 
 class ConsumerBase(object):
@@ -135,10 +120,27 @@ class ConsumerBase(object):
         self.receiver = session.receiver(self.address)
         self.receiver.capacity = 1
 
+    def _unpack_json_msg(self, msg):
+        """Load the JSON data in msg if msg.content_type indicates that it
+           is necessary.  Put the loaded data back into msg.content and
+           update msg.content_type appropriately.
+
+        A Qpid Message containing a dict will have a content_type of
+        'amqp/map', whereas one containing a string that needs to be converted
+        back from JSON will have a content_type of JSON_CONTENT_TYPE.
+
+        :param msg: a Qpid Message object
+        :returns: None
+        """
+        if msg.content_type == JSON_CONTENT_TYPE:
+            msg.content = jsonutils.loads(msg.content)
+            msg.content_type = 'amqp/map'
+
     def consume(self):
         """Fetch the message and pass it to the callback object"""
         message = self.receiver.fetch()
         try:
+            self._unpack_json_msg(message)
             self.callback(message.content)
         except Exception:
             LOG.exception(_("Failed to process message... skipping it."))
@@ -180,9 +182,9 @@ class TopicConsumer(ConsumerBase):
         :param name: optional queue name, defaults to topic
         """
 
+        exchange_name = rpc_amqp.get_control_exchange(conf)
         super(TopicConsumer, self).__init__(session, callback,
-                                            "%s/%s" % (conf.control_exchange,
-                                                       topic),
+                                            "%s/%s" % (exchange_name, topic),
                                             {}, name or topic, {})
 
 
@@ -238,8 +240,35 @@ class Publisher(object):
         """Re-establish the Sender after a reconnection"""
         self.sender = session.sender(self.address)
 
+    def _pack_json_msg(self, msg):
+        """Qpid cannot serialize dicts containing strings longer than 65535
+           characters.  This function dumps the message content to a JSON
+           string, which Qpid is able to handle.
+
+        :param msg: May be either a Qpid Message object or a bare dict.
+        :returns: A Qpid Message with its content field JSON encoded.
+        """
+        try:
+            msg.content = jsonutils.dumps(msg.content)
+        except AttributeError:
+            # Need to have a Qpid message so we can set the content_type.
+            msg = qpid.messaging.Message(jsonutils.dumps(msg))
+        msg.content_type = JSON_CONTENT_TYPE
+        return msg
+
     def send(self, msg):
         """Send a message"""
+        try:
+            # Check if Qpid can encode the message
+            check_msg = msg
+            if not hasattr(check_msg, 'content_type'):
+                check_msg = qpid.messaging.Message(msg)
+            content_type = check_msg.content_type
+            enc, dec = qpid.messaging.message.get_codec(content_type)
+            enc(check_msg.content)
+        except qpid_codec.CodecException:
+            # This means the message couldn't be serialized as a dict.
+            msg = self._pack_json_msg(msg)
         self.sender.send(msg)
 
 
@@ -256,9 +285,9 @@ class TopicPublisher(Publisher):
     def __init__(self, conf, session, topic):
         """init a 'topic' publisher.
         """
-        super(TopicPublisher, self).__init__(
-            session,
-            "%s/%s" % (conf.control_exchange, topic))
+        exchange_name = rpc_amqp.get_control_exchange(conf)
+        super(TopicPublisher, self).__init__(session,
+                                             "%s/%s" % (exchange_name, topic))
 
 
 class FanoutPublisher(Publisher):
@@ -276,10 +305,10 @@ class NotifyPublisher(Publisher):
     def __init__(self, conf, session, topic):
         """init a 'topic' publisher.
         """
-        super(NotifyPublisher, self).__init__(
-            session,
-            "%s/%s" % (conf.control_exchange, topic),
-            {"durable": True})
+        exchange_name = rpc_amqp.get_control_exchange(conf)
+        super(NotifyPublisher, self).__init__(session,
+                                              "%s/%s" % (exchange_name, topic),
+                                              {"durable": True})
 
 
 class Connection(object):
@@ -306,36 +335,26 @@ class Connection(object):
             params.setdefault(key, default_params[key])
 
         self.broker = params['hostname'] + ":" + str(params['port'])
+        self.username = params['username']
+        self.password = params['password']
+        self.connection_create()
+        self.reconnect()
+
+    def connection_create(self):
         # Create the connection - this does not open the connection
         self.connection = qpid.messaging.Connection(self.broker)
 
         # Check if flags are set and if so set them for the connection
         # before we call open
-        self.connection.username = params['username']
-        self.connection.password = params['password']
+        self.connection.username = self.username
+        self.connection.password = self.password
+
         self.connection.sasl_mechanisms = self.conf.qpid_sasl_mechanisms
-        self.connection.reconnect = self.conf.qpid_reconnect
-        if self.conf.qpid_reconnect_timeout:
-            self.connection.reconnect_timeout = (
-                self.conf.qpid_reconnect_timeout)
-        if self.conf.qpid_reconnect_limit:
-            self.connection.reconnect_limit = self.conf.qpid_reconnect_limit
-        if self.conf.qpid_reconnect_interval_max:
-            self.connection.reconnect_interval_max = (
-                self.conf.qpid_reconnect_interval_max)
-        if self.conf.qpid_reconnect_interval_min:
-            self.connection.reconnect_interval_min = (
-                self.conf.qpid_reconnect_interval_min)
-        if self.conf.qpid_reconnect_interval:
-            self.connection.reconnect_interval = (
-                self.conf.qpid_reconnect_interval)
+        # Reconnection is done by self.reconnect()
+        self.connection.reconnect = False
         self.connection.heartbeat = self.conf.qpid_heartbeat
         self.connection.protocol = self.conf.qpid_protocol
         self.connection.tcp_nodelay = self.conf.qpid_tcp_nodelay
-
-        # Open is part of reconnect -
-        # NOTE(WGH) not sure we need this with the reconnect flags
-        self.reconnect()
 
     def _register_consumer(self, consumer):
         self.consumers[str(consumer.get_receiver())] = consumer
@@ -351,12 +370,18 @@ class Connection(object):
             except qpid.messaging.exceptions.ConnectionError:
                 pass
 
+        delay = 1
         while True:
             try:
+                self.connection_create()
                 self.connection.open()
             except qpid.messaging.exceptions.ConnectionError, e:
-                LOG.error(_('Unable to connect to AMQP server: %s'), e)
-                time.sleep(self.conf.qpid_reconnect_interval or 1)
+                msg_dict = dict(e=e, delay=delay)
+                msg = _("Unable to connect to AMQP server: %(e)s. "
+                        "Sleeping %(delay)s seconds") % msg_dict
+                LOG.error(msg)
+                time.sleep(delay)
+                delay = min(2 * delay, 60)
             else:
                 break
 
@@ -364,10 +389,14 @@ class Connection(object):
 
         self.session = self.connection.session()
 
-        for consumer in self.consumers.itervalues():
-            consumer.reconnect(self.session)
-
         if self.consumers:
+            consumers = self.consumers
+            self.consumers = {}
+
+            for consumer in consumers.itervalues():
+                consumer.reconnect(self.session)
+                self._register_consumer(consumer)
+
             LOG.debug(_("Re-established AMQP queues"))
 
     def ensure(self, error_callback, method, *args, **kwargs):
